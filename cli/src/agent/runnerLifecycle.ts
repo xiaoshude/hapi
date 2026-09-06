@@ -25,27 +25,11 @@ export type RunnerLifecycle = {
 
 export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLifecycle {
     let exitCode = 0
-    // tiann/hapi#914: default reason is 'Hub restart' (parent-driven SIGTERM
-    // is the most common non-user cause). Genuine user actions (clicking
-    // Archive in the web UI, or Ctrl-C in a local terminal) explicitly
-    // reassign this via `setArchiveReason` BEFORE `cleanupAndExit` runs:
-    //   - KillSession RPC handler  → 'User terminated' (see registerKillSessionHandler)
-    //   - SIGINT handler           → 'User terminated' (Ctrl-C in local terminal)
-    //   - uncaughtException/Reject → 'Session crashed' (via markCrash)
-    //
-    // Out-of-band SIGTERM (hub-restart cascade, systemd cgroup kill on
-    // hapi-runner.service stop, `kill <pid>` from the operator) keeps the
-    // default and is correctly labelled 'Hub restart' on the audit trail.
-    //
-    // Runner-internal stop paths (`hapi runner stop-session`, webhook-timeout
-    // cleanup at run.ts:587, orphan cleanup at run.ts:267) also currently
-    // hit this default - that is technically inaccurate but follows the
-    // friction-mode "smallest defensible change" rule for this PR. Finer
-    // attribution would require an IPC channel (stdio: 'ipc' on spawn) so
-    // the runner can stamp `setArchiveReason` before SIGTERMing; tracked as
-    // a follow-up to keep this PR focussed on the user-action lie that
-    // motivated #914.
-    let archiveReason = 'Hub restart'
+    // Process lifetime and conversation lifetime are independent. A signal
+    // from an idle reaper or supervisor proves neither user archive intent
+    // nor a Hub restart. Only explicit archive/clear or completed runs archive.
+    let archiveReason = 'Process terminated'
+    let archiveRequested = false
     let sessionEndReason: SessionEndReason = 'terminated'
     let sessionEndReasonExplicit = false
     let cleanupStarted = false
@@ -55,16 +39,36 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
 
     const logPrefix = `[${options.logTag}]`
 
-    const archiveAndClose = async () => {
-        options.session.updateMetadata((currentMetadata) => ({
-            ...currentMetadata,
-            lifecycleState: 'archived',
-            lifecycleStateSince: Date.now(),
-            archivedBy: 'cli',
-            archiveReason
-        }))
+    const updateExitMetadata = () => {
+        options.session.updateMetadata((currentMetadata) => {
+            const at = Date.now()
+            const exit = { at, reason: archiveReason }
+            if (archiveRequested) {
+                return {
+                    ...currentMetadata, lifecycleState: 'archived',
+                    lifecycleStateSince: at, archivedBy: 'cli', archiveReason,
+                    lastProcessExit: exit
+                }
+            }
+            // Never resurrect a row another actor has already archived/deleted.
+            const terminal = currentMetadata.lifecycleState === 'archived'
+                || currentMetadata.lifecycleState === 'deleted'
+            return {
+                ...currentMetadata,
+                lifecycleState: currentMetadata.lifecycleState || 'running',
+                ...(!terminal ? { archivedBy: undefined, archiveReason: undefined } : {}),
+                lastProcessExit: exit
+            }
+        })
+    }
 
-        options.session.sendSessionDeath(sessionEndReason)
+    const archiveAndClose = async () => {
+        updateExitMetadata()
+
+        // Older Hubs treat session-end as terminal: they consume queued user
+        // prompts and the CLI deletes upload files. Retirement must use normal
+        // socket expiry instead, preserving both for a later attach.
+        if (archiveRequested) options.session.sendSessionDeath(sessionEndReason)
         await options.session.flush({ timeoutMs: 1_000 })
         await options.session.close()
     }
@@ -106,14 +110,8 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
             restoreTerminalState()
             options.stopKeepAlive?.()
             await options.onBeforeClose?.()
-            options.session.updateMetadata((currentMetadata) => ({
-                ...currentMetadata,
-                lifecycleState: 'archived',
-                lifecycleStateSince: Date.now(),
-                archivedBy: 'cli',
-                archiveReason
-            }))
-            options.session.sendSessionDeath(sessionEndReason)
+            updateExitMetadata()
+            if (archiveRequested) options.session.sendSessionDeath(sessionEndReason)
             confirmedCleanupPrepared = true
         }
 
@@ -152,22 +150,15 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
 
     const setArchiveReason = (reason: string) => {
         archiveReason = reason
+        archiveRequested = true
     }
 
     const setSessionEndReason = (reason: SessionEndReason) => {
         sessionEndReason = reason
         sessionEndReasonExplicit = true
-        // tiann/hapi#914 review round 4: every agent runner
-        // (runClaude / runCodex / runCursor / runGemini / runKimi /
-        // runOpencode) calls setSessionEndReason('completed') before
-        // cleanupAndExit() on the natural-exit path without setting an
-        // archive reason. With the SIGTERM-driven default of 'Hub restart',
-        // clean completions would otherwise be audit-trailed as restart
-        // cascades. Flip the default to 'Session completed' when the end
-        // reason transitions to 'completed' AND no caller has already
-        // overridden the archive reason.
-        if (reason === 'completed' && archiveReason === 'Hub restart') {
+        if (reason === 'completed' && !archiveRequested) {
             archiveReason = 'Session completed'
+            archiveRequested = true
         }
     }
 
@@ -181,11 +172,7 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
     }
 
     const registerProcessHandlers = () => {
-        // tiann/hapi#914: SIGTERM is treated as the default reason ('Hub restart')
-        // because the runner is restarted by systemd as part of hub restart in
-        // production. If a future code path needs to distinguish "operator
-        // killed the host process" from "hub restart", it can call
-        // setArchiveReason() before the runner exits.
+        // SIGTERM retires this process; it does not archive the conversation.
         process.on('SIGTERM', () => {
             void cleanupAndExit()
         })
@@ -193,7 +180,7 @@ export function createRunnerLifecycle(options: RunnerLifecycleOptions): RunnerLi
         // Ctrl-C in a local terminal is genuine user intent — keep the
         // pre-#914 label so the audit trail still shows it.
         process.on('SIGINT', () => {
-            archiveReason = 'User terminated'
+            setArchiveReason('User terminated')
             void cleanupAndExit()
         })
 

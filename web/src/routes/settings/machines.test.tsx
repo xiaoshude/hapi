@@ -60,6 +60,15 @@ describe('SettingsMachinesPage', () => {
         cleanup()
     })
 
+    it('labels machine diagnostics as a previous failure, separate from creating a session', () => {
+        machinesMock.mockReturnValue([makeMachine({ runnerState: { lastSpawnError: {
+            message: 'no rollout found for thread id old-thread', at: 1000
+        } } } as Partial<Machine>)])
+        renderPage()
+        expect(screen.getByText(/Previous session launch failure/)).toBeTruthy()
+        expect(screen.getByText(/no rollout found for thread id old-thread/)).toBeTruthy()
+    })
+
     it('falls back to the hostname and always shows host and platform', () => {
         renderPage()
 

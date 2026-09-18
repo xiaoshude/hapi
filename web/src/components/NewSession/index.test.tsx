@@ -171,9 +171,6 @@ vi.mock('@/hooks/queries/usePiModelsForMachine', () => ({
         error: mocks.piModelsError
     })
 }))
-vi.mock('../../utils/formatRunnerSpawnError', () => ({
-    formatRunnerSpawnError: () => null
-}))
 vi.mock('@/components/CodexSessionSyncDialog', () => ({
     CodexSessionSyncDialog: () => null
 }))
@@ -315,6 +312,14 @@ describe('NewSession launch preferences', () => {
         mocks.refetchSessions.mockResolvedValue(undefined)
         mocks.addToast.mockReset()
         savePreferredAgent('codex')
+    })
+
+    it('does not show an earlier resume failure as a new-session error', () => {
+        const failedMachine = { ...machine, runnerState: { lastSpawnError: {
+            message: 'no rollout found for thread id old-thread', at: 1000
+        } } } as Machine
+        render(<NewSession api={api} machines={[failedMachine]} initialMachineId="machine-1" initialDirectory="C:\\repo" onSuccess={mocks.onSuccess} onCancel={() => {}} />)
+        expect(screen.queryByText(/no rollout found/)).toBeNull()
     })
 
     it('hides unavailable Agents and falls back to the first available Agent', async () => {

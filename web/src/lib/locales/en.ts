@@ -1085,6 +1085,8 @@ export default {
   'settings.companion.copied': 'Copied!',
   'settings.companion.hide': 'Hide',
   'settings.machines.title': 'Machines',
+  'settings.machines.previousLaunchFailure': 'Previous session launch failure',
+  'settings.machines.previousLaunchFailureDescription': 'Historical diagnostic for this machine; this is not a new-session error.',
   'settings.machines.description': 'Give your machines names of your own. Only machines that are currently online are listed.',
   'settings.machines.section': 'Your machines',
   'settings.machines.rename': 'Rename {name}',

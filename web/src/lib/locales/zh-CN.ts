@@ -1083,6 +1083,8 @@ export default {
   'settings.companion.copied': '已复制！',
   'settings.companion.hide': '隐藏',
   'settings.machines.title': '设备',
+  'settings.machines.previousLaunchFailure': '上一次会话启动失败',
+  'settings.machines.previousLaunchFailureDescription': '这是该机器的历史诊断，不表示当前新建会话失败。',
   'settings.machines.description': '给设备起自己的名字。这里只列出当前在线的设备。',
   'settings.machines.section': '我的设备',
   'settings.machines.rename': '重命名 {name}',

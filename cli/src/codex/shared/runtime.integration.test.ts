@@ -48,10 +48,15 @@ vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: async () => 
 // Explicit opt-in: installed official binary, entirely isolated CODEX_HOME, mock Responses API only.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Codex shared runtime', () => {
     afterEach(() => { vi.unstubAllEnvs(); state.sessions.clear(); state.beforeBootstrap = undefined; });
-    it('explains a missing rollout before creating or modifying a HAPI binding', async () => {
+    it.each([false, true])('explains a missing rollout before changing a binding (stale index: %s)', async (staleIndex) => {
         const home = await mkdtemp('/tmp/hapi-missing-rollout-'); state.home = home;
         const ch = join(home, 'codex'); await mkdir(ch);
         vi.stubEnv('CODEX_HOME', ch); vi.stubEnv('HOME', home);
+        const original = CodexAppServerClient.prototype.request;
+        const missingRead = staleIndex ? vi.spyOn(CodexAppServerClient.prototype, 'request').mockImplementation(function<T>(this: CodexAppServerClient, method: string, params?: unknown): Promise<T> {
+            if (method === 'thread/read') return Promise.reject(new Error('no rollout found for thread id 11111111-1111-4111-8111-111111111111'));
+            return original.call(this, method, params) as Promise<T>;
+        }) : undefined;
         const ready = vi.fn();
         try {
             const { runSharedRuntime } = await import('./runtime');
@@ -59,7 +64,7 @@ describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Code
                 .rejects.toThrow('CODEX_HISTORY_MISSING');
             expect(ready).not.toHaveBeenCalled();
             expect(state.sessions.size).toBe(0);
-        } finally { await rm(home, { recursive: true, force: true }); }
+        } finally { missingRead?.mockRestore(); await rm(home, { recursive: true, force: true }); }
     }, 30_000);
 
     it('rejects a child ID before creating a HAPI binding or calling native resume', async () => {

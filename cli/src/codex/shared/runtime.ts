@@ -345,7 +345,15 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         }
         if (options.resumeSessionId) {
             const threadId = options.resumeSessionId;
-            const thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+            let thread: Record<string, unknown>;
+            try {
+                thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+            } catch (error) {
+                if (error instanceof Error && /^(no rollout found for thread id |thread not loaded: )/.test(error.message)) {
+                    throw new Error(`CODEX_HISTORY_MISSING: Cannot resume Codex thread ${threadId}: its local history is unavailable on this machine. Restore the original rollout from an archive or backup, or create a separate new session. The existing session has not been replaced.`, { cause: error });
+                }
+                throw error;
+            }
             if (string(thread.parentThreadId)) {
                 throw new Error('Cannot cold-resume a child agent independently. Resume its parent HAPI session instead.');
             }

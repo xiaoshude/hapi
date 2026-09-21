@@ -6,6 +6,7 @@ import type { CliSocketWithData } from '../../socketTypes'
 import { registerSessionHandlers } from './sessionHandlers'
 
 class FakeSocket {
+    data = { namespace: 'default' }
     readonly roomEvents: Array<{ room: string; event: string; data: unknown }> = []
     private readonly handlers = new Map<string, (data: unknown, ack?: (response: unknown) => void) => void>()
 
@@ -488,4 +489,49 @@ describe('cli session handlers', () => {
             supersededBySessionId: 'owned-target', opencodeClearOperation: operation, lifecycleState: 'archived'
         })
     })
+})
+
+describe('history replay ingress', () => {
+    it('does not decode or fan out already persisted local IDs on reconnect', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('replay', { replayMetadata: 'x'.repeat(60_000) }, null, 'default')
+        const socket = new FakeSocket()
+        const events: SyncEvent[] = []
+        let resolutions = 0
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store, resolveSessionAccess: () => { resolutions++; return { ok: true, value: session } }, emitAccessError() {},
+            onWebappEvent: event => events.push(event)
+        })
+        const payload = { sid: session.id, localId: 'stable-id', message: {
+            role: 'agent', content: { type: 'text', text: 'x'.repeat(60_000) }
+        } }
+        socket.trigger('message', payload)
+        const insert = store.messages.addMessage.bind(store.messages)
+        let repeatedReads = 0
+        store.messages.addMessage = (...args) => { repeatedReads++; return insert(...args) }
+        for (let i = 0; i < 1000; i++) socket.trigger('message', payload)
+        expect(resolutions).toBe(1)
+        expect(repeatedReads).toBe(0)
+        expect(events.filter(event => event.type === 'message-received')).toHaveLength(1)
+        expect(socket.roomEvents).toHaveLength(1)
+        expect(store.messages.countMessages(session.id)).toBe(1)
+        store.close()
+    })
+})
+
+
+it('duplicate ingress never bypasses namespace ownership', () => {
+    const store = new Store(':memory:')
+    const session = store.sessions.getOrCreateSession('private-replay', {}, null, 'private')
+    store.messages.addMessage(session.id, { role: 'user' }, 'stable')
+    const socket = new FakeSocket()
+    const denied = mock()
+    registerSessionHandlers(socket as unknown as CliSocketWithData, {
+        store, resolveSessionAccess: () => ({ ok: false, reason: 'access-denied' }), emitAccessError: denied
+    })
+    socket.trigger('message', { sid: session.id, localId: 'stable', message: {} })
+    expect(denied).toHaveBeenCalledTimes(1)
+    expect(store.messages.hasLocalMessage(session.id, 'stable', 'default')).toBe(false)
+    expect(store.messages.hasLocalMessage(session.id, 'stable', 'private')).toBe(true)
+    store.close()
 })

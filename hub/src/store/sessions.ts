@@ -328,7 +328,8 @@ export function updateSessionAgentState(
     id: string,
     agentState: unknown,
     expectedVersion: number,
-    namespace: string
+    namespace: string,
+    options?: { touchUpdatedAt?: boolean }
 ): VersionedUpdateResult<unknown | null> {
     const now = Date.now()
     const normalized = agentState ?? null
@@ -344,8 +345,8 @@ export function updateSessionAgentState(
         value: normalized,
         encode: (value) => (value === null ? null : JSON.stringify(value)),
         decode: safeJsonParse,
-        setClauses: ['updated_at = @updated_at', 'seq = seq + 1'],
-        params: { updated_at: now }
+        setClauses: ['updated_at = CASE WHEN @touch_updated_at = 1 THEN @updated_at ELSE updated_at END', 'seq = seq + 1'],
+        params: { updated_at: now, touch_updated_at: options?.touchUpdatedAt !== false ? 1 : 0 }
     })
 }
 

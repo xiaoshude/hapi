@@ -129,6 +129,19 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
         }
 
         const { sid, localId, createdAt } = parsed.data
+        // Check ownership and durable identity without loading large metadata or
+        // decompressing content. Replayed history is not a new conversation event.
+        const namespace = socket.data?.namespace
+        if (localId && typeof namespace === 'string'
+            && store.messages.hasLocalMessage(sid, localId, namespace)) return
+
+        const sessionAccess = resolveSessionAccess(sid)
+        if (!sessionAccess.ok) {
+            emitAccessError('session', sid, sessionAccess.reason)
+            return
+        }
+        const session = sessionAccess.value
+
         const raw = parsed.data.message
 
         const content = typeof raw === 'string'
@@ -140,13 +153,6 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
                 }
             })()
             : raw
-
-        const sessionAccess = resolveSessionAccess(sid)
-        if (!sessionAccess.ok) {
-            emitAccessError('session', sid, sessionAccess.reason)
-            return
-        }
-        const session = sessionAccess.value
 
         if (isRedundantGoalStatusEventContent(content)) {
             return
@@ -269,7 +275,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             sid,
             preserveHubOwnedMetadata(metadata, sessionAccess.value.metadata),
             expectedVersion,
-            sessionAccess.value.namespace
+            sessionAccess.value.namespace,
+            // CLI metadata/state can be replayed on reconnect without a new turn.
+            { touchUpdatedAt: false }
         )
         if (result.result === 'success') {
             cb({ result: 'success', version: result.version, metadata: result.value })
@@ -335,7 +343,9 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             sid,
             agentState,
             expectedVersion,
-            sessionAccess.value.namespace
+            sessionAccess.value.namespace,
+            // CLI metadata/state can be replayed on reconnect without a new turn.
+            { touchUpdatedAt: false }
         )
         if (result.result === 'success') {
             cb({ result: 'success', version: result.version, agentState: result.value })

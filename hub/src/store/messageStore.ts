@@ -135,6 +135,13 @@ export class MessageStore {
         return bumpMessageEpoch(this.db, sessionId)
     }
 
+    hasLocalMessage(sessionId: string, localId: string, namespace: string): boolean {
+        // Cached indexed existence check: never decompress history during retries.
+        return this.db.query(`SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session_id
+            WHERE m.session_id = ? AND m.local_id = ? AND s.namespace = ? LIMIT 1`)
+            .get(sessionId, localId, namespace) !== null
+    }
+
     getLocalMessageStates(sessionId: string, localIds: string[]): LocalMessageState[] {
         return getLocalMessageStates(this.db, sessionId, localIds)
     }

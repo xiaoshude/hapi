@@ -373,3 +373,49 @@ describe('SSEManager agy catalog announcements', () => {
         expect(globalBeta).toHaveLength(0)
     })
 })
+
+describe('slow-client resource bounds', () => {
+    it('disconnects a stuck live writer while healthy clients keep receiving', () => {
+        const manager = new SSEManager(0, new VisibilityTracker())
+        let calls = 0, closed = 0, healthy = 0
+        manager.subscribe({ id: 'slow', namespace: 'alpha', all: true,
+            send: () => { calls++; return new Promise<void>(() => {}) }, sendHeartbeat() {},
+            close: () => { closed++ }
+        })
+        manager.subscribe({ id: 'fast', namespace: 'alpha', all: true,
+            send: () => { healthy++ }, sendHeartbeat() {} })
+        for (let i=0;i<1000;i++) manager.broadcast({type:'session-updated',sessionId:'s',namespace:'alpha'})
+        expect(manager.hasSubscription('slow')).toBe(false)
+        expect(calls).toBeLessThanOrEqual(64)
+        expect(closed).toBe(1)
+        expect(healthy).toBe(1000)
+        manager.stop()
+    })
+    it('bounds live events pending behind a stalled replay', () => {
+        const manager = new SSEManager(0, new VisibilityTracker())
+        let cursor = ''
+        manager.subscribe({id:'seed',namespace:'alpha',all:true,send:(_,id)=>{cursor=id!},sendHeartbeat(){}})
+        manager.broadcast({type:'session-updated',sessionId:'s',namespace:'alpha'})
+        const resumeFrom=cursor
+        manager.broadcast({type:'session-updated',sessionId:'s',namespace:'alpha'})
+        let closed=0
+        manager.subscribe({id:'replay',namespace:'alpha',all:true,resumeFrom,send(){},sendHeartbeat(){},close(){closed++}})
+        for(let i=0;i<1000;i++) manager.broadcast({type:'session-updated',sessionId:'s',namespace:'alpha'})
+        expect(manager.hasSubscription('replay')).toBe(false)
+        expect(closed).toBe(1)
+        manager.stop()
+    })
+})
+
+
+it('disconnects a timed-out SSE write even without further traffic', async () => {
+    const manager = new SSEManager(0, new VisibilityTracker(), 5)
+    let closed = 0
+    manager.subscribe({id:'timeout',namespace:'alpha',all:true,
+        send:()=>new Promise<void>(()=>{}),sendHeartbeat(){},close(){closed++}})
+    manager.broadcast({type:'session-updated',sessionId:'s',namespace:'alpha'})
+    await new Promise(resolve=>setTimeout(resolve,25))
+    expect(closed).toBe(1)
+    expect(manager.hasSubscription('timeout')).toBe(false)
+    manager.stop()
+})

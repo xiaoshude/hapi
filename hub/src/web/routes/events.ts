@@ -96,6 +96,7 @@ export function createEventsRoutes(
                 machineId,
                 visibility,
                 resumeFrom,
+                close: () => stream.abort(),
                 send: (event, eventId) => stream.writeSSE({ data: JSON.stringify(event), id: eventId }),
                 sendHeartbeat: async () => {
                     await stream.writeSSE({

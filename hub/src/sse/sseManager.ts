@@ -12,6 +12,10 @@ export type SSESubscription = {
 }
 
 type SSEConnection = SSESubscription & {
+    close?: () => void
+    inFlight: number
+    inFlightBytes: number
+    pendingBytes: number
     send: (event: SyncEvent, eventId?: string) => void | Promise<void>
     sendHeartbeat: () => void | Promise<void>
     /**
@@ -29,6 +33,10 @@ export type SSEResumeResult = {
 }
 
 /** How many broadcast events are kept for reconnect replay. */
+const MAX_CONNECTION_WRITES = 64
+const MAX_CONNECTION_BYTES = 2 * 1024 * 1024
+const MAX_PENDING_EVENTS = 128
+const WRITE_TIMEOUT_MS = 15_000
 const EVENT_BUFFER_CAPACITY = 256
 /**
  * Byte budget for the replay buffer (sum of JSON-encoded events). Bounds
@@ -57,7 +65,7 @@ export class SSEManager {
     private eventBufferBytes = 0
     private readonly namespaceTags = new Map<string, string>()
 
-    constructor(heartbeatMs = 30_000, visibilityTracker: VisibilityTracker) {
+    constructor(heartbeatMs = 30_000, visibilityTracker: VisibilityTracker, private readonly writeTimeoutMs = WRITE_TIMEOUT_MS) {
         this.heartbeatMs = heartbeatMs
         this.visibilityTracker = visibilityTracker
     }
@@ -73,6 +81,7 @@ export class SSEManager {
         resumeFrom?: string | null
         send: (event: SyncEvent, eventId?: string) => void | Promise<void>
         sendHeartbeat: () => void | Promise<void>
+        close?: () => void
     }): SSESubscription & SSEResumeResult {
         const subscription: SSEConnection = {
             id: options.id,
@@ -82,7 +91,11 @@ export class SSEManager {
             machineId: options.machineId ?? null,
             send: options.send,
             sendHeartbeat: options.sendHeartbeat,
-            pending: null
+            pending: null,
+            close: options.close,
+            inFlight: 0,
+            inFlightBytes: 0,
+            pendingBytes: 0
         }
 
         const { resume, replay } = this.resolveResume(subscription, options.resumeFrom ?? null)
@@ -122,6 +135,7 @@ export class SSEManager {
         }
         while (connection.pending) {
             const batch = connection.pending.splice(0)
+            connection.pendingBytes = 0
             if (batch.length === 0) {
                 // No await between this check and the assignment, so no
                 // broadcast can slip into the queue and be dropped.
@@ -130,7 +144,9 @@ export class SSEManager {
             }
             for (const item of batch) {
                 try {
-                    await connection.send(item.event, item.eventId)
+                    const ok = await this.sendBounded(connection,
+                        () => connection.send(item.event, item.eventId), Buffer.byteLength(JSON.stringify(item.event)))
+                    if (!ok) return
                 } catch {
                     this.unsubscribe(connection.id)
                     return
@@ -187,12 +203,12 @@ export class SSEManager {
 
     private recordEvent(event: SyncEvent): number {
         const seq = this.nextSeq++
-        const bytes = JSON.stringify(event).length
+        const bytes = Buffer.byteLength(JSON.stringify(event))
         this.eventBuffer.push({ seq, event, bytes })
         this.eventBufferBytes += bytes
         while (
             this.eventBuffer.length > EVENT_BUFFER_CAPACITY
-            || (this.eventBufferBytes > EVENT_BUFFER_MAX_BYTES && this.eventBuffer.length > 1)
+            || (this.eventBufferBytes > EVENT_BUFFER_MAX_BYTES && this.eventBuffer.length > 0)
         ) {
             const evicted = this.eventBuffer.shift()
             if (evicted) {
@@ -203,7 +219,13 @@ export class SSEManager {
     }
 
     unsubscribe(id: string): void {
+        const connection = this.connections.get(id)
         this.connections.delete(id)
+        if (connection) {
+            connection.pending = null
+            connection.pendingBytes = 0
+            try { connection.close?.() } catch {}
+        }
         this.visibilityTracker.removeConnection(id)
         if (this.connections.size === 0) {
             this.stopHeartbeat()
@@ -212,6 +234,35 @@ export class SSEManager {
 
     hasSubscription(id: string): boolean {
         return this.connections.has(id)
+    }
+
+    private sendBounded(connection: SSEConnection, send: () => void | Promise<void>, bytes: number): Promise<boolean> {
+        if (this.connections.get(connection.id) !== connection) return Promise.resolve(false)
+        if (connection.inFlight >= MAX_CONNECTION_WRITES || connection.inFlightBytes + bytes > MAX_CONNECTION_BYTES) {
+            this.unsubscribe(connection.id)
+            return Promise.resolve(false)
+        }
+        connection.inFlight++
+        connection.inFlightBytes += bytes
+        const release = () => { connection.inFlight--; connection.inFlightBytes -= bytes }
+        const disconnect = () => {
+            if (this.connections.get(connection.id) === connection) this.unsubscribe(connection.id)
+        }
+        try {
+            const result = send()
+            if (!result) { release(); return Promise.resolve(true) }
+            let timer: ReturnType<typeof setTimeout>
+            const timeout = new Promise<boolean>(resolve => {
+                timer = setTimeout(() => { disconnect(); resolve(false) }, this.writeTimeoutMs)
+                timer.unref()
+            })
+            return Promise.race([
+                Promise.resolve(result).then(() => true, () => { disconnect(); return false }),
+                timeout
+            ]).finally(() => { clearTimeout(timer); release() })
+        } catch {
+            release(); disconnect(); return Promise.resolve(false)
+        }
     }
 
     async sendToast(namespace: string, event: Extract<SyncEvent, { type: 'toast' }>): Promise<number> {
@@ -225,9 +276,8 @@ export class SSEManager {
             }
 
             deliveries.push(
-                Promise.resolve(connection.send(event))
-                    .then(() => ({ id: connection.id, ok: true }))
-                    .catch(() => ({ id: connection.id, ok: false }))
+                this.sendBounded(connection, () => connection.send(event), Buffer.byteLength(JSON.stringify(event)))
+                    .then(ok => ({ id: connection.id, ok }))
             )
         }
 
@@ -258,23 +308,24 @@ export class SSEManager {
             // The id is per-connection: same epoch and seq, but tagged with
             // the receiving namespace so the cursor stays bound to it.
             const eventId = this.eventIdFor(seq, connection.namespace)
+            const bytes = Buffer.byteLength(JSON.stringify(event))
             if (connection.pending) {
+                if (connection.pending.length >= MAX_PENDING_EVENTS || connection.pendingBytes + bytes > MAX_CONNECTION_BYTES) {
+                    this.unsubscribe(connection.id)
+                    continue
+                }
                 connection.pending.push({ event, eventId })
+                connection.pendingBytes += bytes
                 continue
             }
 
-            void Promise.resolve(connection.send(event, eventId)).catch(() => {
-                this.unsubscribe(connection.id)
-            })
+            void this.sendBounded(connection, () => connection.send(event, eventId), bytes)
         }
     }
 
     stop(): void {
         this.stopHeartbeat()
-        for (const id of this.connections.keys()) {
-            this.visibilityTracker.removeConnection(id)
-        }
-        this.connections.clear()
+        for (const id of this.connections.keys()) this.unsubscribe(id)
     }
 
     private ensureHeartbeat(): void {
@@ -284,9 +335,9 @@ export class SSEManager {
 
         this.heartbeatTimer = setInterval(() => {
             for (const connection of this.connections.values()) {
-                void Promise.resolve(connection.sendHeartbeat()).catch(() => {
-                    this.unsubscribe(connection.id)
-                })
+                if (!connection.pending && connection.inFlight === 0) {
+                    void this.sendBounded(connection, () => connection.sendHeartbeat(), 128)
+                }
             }
         }, this.heartbeatMs)
     }

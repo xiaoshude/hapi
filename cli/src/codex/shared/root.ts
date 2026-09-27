@@ -8,6 +8,7 @@ import { listSlashCommands } from '@/modules/common/slashCommands';
 import { normalizeCodexModel } from '@/modules/common/codexModels';
 import { formatMessageWithAttachments } from '@/utils/attachmentFormatter';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
+import { CODEX_STEER_TURN_LOOKUP_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts';
 import { ImplementCodexPlanRequestSchema, type ImplementCodexPlanResult } from '@hapi/protocol/apiTypes';
 import { CodexAppServerClient, isIndeterminateError } from '../codexAppServerClient';
 import { buildHapiMcpBridge, type HapiMcpBridge } from '../utils/buildHapiMcpBridge';
@@ -203,7 +204,8 @@ export class SharedCodexRoot {
         this.queue = new SharedCodexQueue(this.client, threadId, join(this.host.directory, `${this.session.sessionId}.queue.json`),
             (ids, steered) => this.session.emitMessagesConsumed(ids, { steered }), ids => this.session.emitSteerIndeterminate(ids),
             (id, input) => this.session.syncNativeQueuedMessage(id, input === null ? null : inputText(input)),
-            ids => this.session.setSteerDeliveryState(ids, 'queued'));
+            ids => this.session.setSteerDeliveryState(ids, 'queued'),
+            ids => this.session.setSteerDeliveryState(ids, 'dispatching'));
         await this.queue.load();
         this.projection = new SharedCodexProjection(this.session, threadId, id => this.queue.committed(id));
         this.session.updateMetadata(metadata => ({ ...metadata, codexSessionId: threadId, capabilities: {
@@ -316,6 +318,33 @@ export class SharedCodexRoot {
             thread.turns = turns;
         } else thread = record(record(await this.client.request('thread/read', { threadId, includeTurns: true })).thread);
         return thread;
+    }
+    private async refreshSteerTurnId(): Promise<string | undefined> {
+        if (!this.threadId || !this.client.isInitialized()) return undefined;
+        const revision = this.turnRevision;
+        const response = record(await this.client.request('thread/turns/list', {
+            threadId: this.threadId,
+            limit: 1,
+            sortDirection: 'desc',
+            itemsView: 'notLoaded'
+        }, { timeoutMs: CODEX_STEER_TURN_LOOKUP_TIMEOUT_MS }));
+        const latest = record(Array.isArray(response.data) ? response.data[0] : undefined);
+        const latestId = string(latest.id);
+        const latestStatus = string(latest.status) ?? 'unknown';
+        const activeTurnId = latestStatus === 'inProgress' ? latestId : undefined;
+        if (revision !== this.turnRevision) return this.currentTurn;
+
+        const turnChanged = this.currentTurn !== activeTurnId
+            || this.latestTurn?.id !== latestId
+            || this.latestTurn?.status !== latestStatus;
+        if (turnChanged) {
+            this.turnRevision++;
+            this.currentTurn = activeTurnId;
+            this.latestTurn = latestId ? { id: latestId, status: latestStatus } : undefined;
+            this.publishSteering();
+            this.publishPlan();
+        }
+        return this.currentTurn;
     }
     refresh(snapshot?: Record<string, unknown>, replay = false): Promise<void> {
         const complete = snapshot ? this.completeThreadSnapshot(snapshot) : undefined;
@@ -531,8 +560,9 @@ export class SharedCodexRoot {
         });
         rpc.registerHandler(RPC_METHODS.SteerQueuedMessage, async raw => {
             const { localId } = z.object({ localId: z.string().min(1) }).parse(raw);
-            const expectedTurnId = this.currentTurn;
-            if (!expectedTurnId) return { steered: false, error: 'No active turn' };
+            const expectedTurnId = Object.assign(() => this.currentTurn, {
+                refresh: () => this.refreshSteerTurnId()
+            });
             return this.queue.steer(localId, expectedTurnId);
         });
         rpc.registerHandler(RPC_METHODS.ClearConversation, async () => {

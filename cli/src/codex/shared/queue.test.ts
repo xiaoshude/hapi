@@ -127,4 +127,46 @@ describe('shared native queue', () => {
         expect(rpc.mock.calls[3]).toEqual(['turn/steer', { threadId: 'thread', expectedTurnId: 'turn-a', input, clientUserMessageId: 'local' }]);
         expect(queue.state('local')).toBe('queued');
     });
+    it('reads the active turn after queue reconciliation and native deletion', async () => {
+        const { queue, rpc } = await fixture();
+        const queued = { id: 'native', input, clientUserMessageId: 'local' };
+        rpc.mockResolvedValueOnce({ queuedSubmission: queued }); await queue.enqueue('local', input);
+        let currentTurnId = 'turn-before-reconcile';
+        rpc.mockResolvedValueOnce({ data: [queued], nextCursor: null })
+            .mockImplementationOnce(async () => { currentTurnId = 'turn-current'; return { deleted: true }; })
+            .mockResolvedValueOnce({});
+
+        await expect(queue.steer('local', () => currentTurnId)).resolves.toMatchObject({ steered: true });
+        expect(rpc.mock.calls[3]).toEqual(['turn/steer', {
+            threadId: 'thread', expectedTurnId: 'turn-current', input, clientUserMessageId: 'local'
+        }]);
+        expect(queue.state('local')).toBe('consumed');
+    });
+    it('retries one definite stale-turn rejection against the new active turn with the same localId', async () => {
+        const { queue, rpc } = await fixture();
+        const queued = { id: 'native', input, clientUserMessageId: 'local' };
+        rpc.mockResolvedValueOnce({ queuedSubmission: queued }); await queue.enqueue('local', input);
+        let currentTurnId = 'turn-old';
+        let steerAttempts = 0;
+        rpc.mockResolvedValueOnce({ data: [queued], nextCursor: null })
+            .mockResolvedValueOnce({ deleted: true })
+            .mockImplementation(async (method, params: any) => {
+                if (method !== 'turn/steer') throw new Error(`unexpected ${method}`);
+                steerAttempts += 1;
+                if (steerAttempts === 1) {
+                    currentTurnId = 'turn-new';
+                    throw new Error('expected active turn id `turn-old` but found `turn-new`');
+                }
+                return {};
+            });
+
+        await expect(queue.steer('local', () => currentTurnId)).resolves.toMatchObject({ steered: true });
+        const steerCalls = rpc.mock.calls.filter(([method]) => method === 'turn/steer');
+        expect(steerCalls).toEqual([
+            ['turn/steer', { threadId: 'thread', expectedTurnId: 'turn-old', input, clientUserMessageId: 'local' }],
+            ['turn/steer', { threadId: 'thread', expectedTurnId: 'turn-new', input, clientUserMessageId: 'local' }],
+        ]);
+        expect(rpc.mock.calls.filter(([method]) => method === 'thread/queue/add')).toHaveLength(1);
+        expect(queue.state('local')).toBe('consumed');
+    });
 });

@@ -689,8 +689,10 @@ describe('ApiMachineClient keepAlive lifecycle', () => {
         const machine = makeMachine('machine-keepalive')
         const client = new ApiMachineClient('cli-token', machine)
         const emit = vi.fn()
-        ;(client as unknown as { socket: { emit: typeof emit; close: () => void } }).socket = {
+        const volatileEmit = vi.fn()
+        ;(client as unknown as { socket: { emit: typeof emit; volatile: { emit: typeof volatileEmit }; close: () => void } }).socket = {
             emit,
+            volatile: { emit: volatileEmit },
             close: vi.fn(),
         } as never
 
@@ -713,8 +715,10 @@ describe('ApiMachineClient keepAlive lifecycle', () => {
         const machine = makeMachine('machine-keepalive-2')
         const client = new ApiMachineClient('cli-token', machine)
         const emit = vi.fn()
-        ;(client as unknown as { socket: { emit: typeof emit; close: () => void } }).socket = {
+        const volatileEmit = vi.fn()
+        ;(client as unknown as { socket: { emit: typeof emit; volatile: { emit: typeof volatileEmit }; close: () => void } }).socket = {
             emit,
+            volatile: { emit: volatileEmit },
             close: vi.fn(),
         } as never
 
@@ -725,12 +729,13 @@ describe('ApiMachineClient keepAlive lifecycle', () => {
 
         priv.startKeepAlive()
         vi.advanceTimersByTime(50)
-        expect(emit).toHaveBeenCalledTimes(1)
+        expect(volatileEmit).toHaveBeenCalledTimes(1)
+        expect(emit).not.toHaveBeenCalled()
 
         client.shutdown()
         vi.advanceTimersByTime(20_000)
 
-        expect(emit).toHaveBeenCalledTimes(1)
+        expect(volatileEmit).toHaveBeenCalledTimes(1)
         expect(priv.keepAliveInterval).toBeNull()
     })
 })
@@ -850,6 +855,7 @@ describe('ApiMachineClient connect runner-state advertisement', () => {
                 if (event === 'connect') connectHandler = handler
             }),
             emit: vi.fn(),
+            volatile: { emit: vi.fn() },
             emitWithAck,
             close: vi.fn()
         }

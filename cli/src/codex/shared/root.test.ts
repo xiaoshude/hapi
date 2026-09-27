@@ -104,6 +104,58 @@ async function completePlan(f: Awaited<ReturnType<typeof fixture>>, status = 'co
 }
 
 describe('shared plan actions', () => {
+    it('surfaces a projection delivery failure to the session instead of swallowing it', async () => {
+        const f = await fixture();
+        vi.spyOn(f.root.session, 'sendUserMessage').mockImplementation(() => {
+            throw new Error('HAPI lossless outbound delivery failed while disconnected');
+        });
+        const notice = vi.spyOn(f.root.session, 'sendSessionEvent');
+
+        f.native.notify('item/started', {
+            threadId: 'thread',
+            turnId: 'turn',
+            item: {
+                id: 'native-user-item',
+                type: 'userMessage',
+                clientId: 'native-local-id',
+                content: [{ type: 'text', text: 'retry me' }]
+            }
+        });
+
+        await vi.waitFor(() => expect(notice).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'message',
+            message: expect.stringContaining('Message not confirmed')
+        })));
+    });
+
+    it('replays a failed projection notice after reconnect when the first notice cannot be sent', async () => {
+        const f = await fixture();
+        vi.spyOn(f.root.session, 'sendUserMessage').mockImplementation(() => {
+            throw new Error('HAPI lossless outbound delivery failed while disconnected');
+        });
+        const notice = vi.spyOn(f.root.session, 'sendSessionEvent')
+            .mockImplementationOnce(() => { throw new Error('socket disconnected'); });
+
+        f.native.notify('item/started', {
+            threadId: 'thread',
+            turnId: 'turn',
+            item: {
+                id: 'native-user-item',
+                type: 'userMessage',
+                clientId: 'native-local-id',
+                content: [{ type: 'text', text: 'retry me' }]
+            }
+        });
+
+        await vi.waitFor(() => expect(notice).toHaveBeenCalledTimes(1));
+        f.reconnect();
+        await vi.waitFor(() => expect(notice).toHaveBeenCalledTimes(2));
+        expect(notice.mock.calls[1]?.[0]).toMatchObject({
+            type: 'message',
+            message: expect.stringContaining('Message not confirmed')
+        });
+    });
+
     it('persists remote title tools while retaining native terminal rename events', async () => {
         const f = await fixture();
         const item = { id: 'title', type: 'mcpToolCall', server: 'hapi', tool: 'change_title',

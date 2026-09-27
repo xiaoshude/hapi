@@ -196,6 +196,11 @@ const DROPPABLE_SOCKET_EVENTS = new Set([
 ])
 
 type BufferedSocketPacket = {
+    // Socket.IO assigns an id to packets that carry an acknowledgement
+    // callback. Such packets must never be reconstructed with socket.emit:
+    // doing so drops the id/callback and can execute a timed-out mutation
+    // after the caller has already treated it as indeterminate.
+    id?: number | string
     data?: unknown[]
 }
 
@@ -810,6 +815,12 @@ export class ApiSessionClient extends EventEmitter {
         const packets = buffered.slice()
         buffered.length = 0
         for (const packet of packets) {
+            if (packet.id !== undefined) {
+                this.reportOutboundDeliveryFailure(
+                    'an acknowledged outbound packet was abandoned after the Hub socket disconnected; reconcile the operation'
+                )
+                continue
+            }
             const event = packet.data?.[0]
             if (typeof event !== 'string') {
                 this.reportOutboundDeliveryFailure()
@@ -1417,6 +1428,11 @@ export class ApiSessionClient extends EventEmitter {
     /** Persist the durable pre-dispatch/restore state with a hub ACK. */
     async setSteerDeliveryState(localIds: string[], state: 'queued' | 'dispatching'): Promise<boolean> {
         if (localIds.length === 0 || this.state !== 'active') return false
+        // ACK packets are not recoverable from Socket.IO's disconnected
+        // sendBuffer: replaying one as a plain event loses its packet id and
+        // can apply a mutation after the caller has treated it as uncertain.
+        if (!await this.waitForConnected(5_000)) return false
+        if (!this.socket.connected) return false
         try {
             const response = await this.socket.timeout(5_000).emitWithAck('messages-steer-state', {
                 sid: this.sessionId,
@@ -1466,10 +1482,18 @@ export class ApiSessionClient extends EventEmitter {
         }
         this.metadataLock.inLock(async () => {
             await backoff(async () => {
+                if (this.state !== 'active') return
+                if (!await this.waitForConnected(5_000)) {
+                    if (this.state !== 'active') return
+                    throw new Error('HAPI socket did not reconnect before metadata ACK')
+                }
+                if (!this.socket.connected) {
+                    throw new Error('HAPI socket disconnected before metadata ACK')
+                }
                 const current = this.metadata ?? ({} as Metadata)
                 const updated = handler(current)
 
-                const answer = await this.socket.emitWithAck('update-metadata', {
+                const answer = await this.socket.timeout(5_000).emitWithAck('update-metadata', {
                     sid: this.sessionId,
                     expectedVersion: this.metadataVersion,
                     metadata: updated
@@ -1511,10 +1535,18 @@ export class ApiSessionClient extends EventEmitter {
         }
         this.agentStateLock.inLock(async () => {
             await backoff(async () => {
+                if (this.state !== 'active') return
+                if (!await this.waitForConnected(5_000)) {
+                    if (this.state !== 'active') return
+                    throw new Error('HAPI socket did not reconnect before agent-state ACK')
+                }
+                if (!this.socket.connected) {
+                    throw new Error('HAPI socket disconnected before agent-state ACK')
+                }
                 const current = this.agentState ?? ({} as AgentState)
                 const updated = handler(current)
 
-                const answer = await this.socket.emitWithAck('update-state', {
+                const answer = await this.socket.timeout(5_000).emitWithAck('update-state', {
                     sid: this.sessionId,
                     expectedVersion: this.agentStateVersion,
                     agentState: updated

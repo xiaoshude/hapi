@@ -180,11 +180,39 @@ export type ApiSessionClientOptions = {
 type PendingOutboundEvent = {
     emit: () => void
     retention: 'lossless' | 'droppable'
+    estimatedBytes: number
 }
 
 const MAX_PENDING_DROPPABLE_EVENTS = 256
+const MAX_PENDING_LOSSLESS_EVENTS = 1_024
+const MAX_PENDING_DROPPABLE_BYTES = 4 * 1024 * 1024
+const MAX_PENDING_LOSSLESS_BYTES = 16 * 1024 * 1024
 const MATERIALIZATION_RETRY_MIN_MS = 1_000
 const MATERIALIZATION_RETRY_MAX_MS = 30_000
+const DROPPABLE_SOCKET_EVENTS = new Set([
+    'agent-terminal:output',
+    'session-alive',
+    'terminal:output'
+])
+
+type BufferedSocketPacket = {
+    data?: unknown[]
+}
+
+class OutboundDeliveryError extends Error {
+    constructor() {
+        super('HAPI lossless outbound delivery failed while the Hub socket was disconnected')
+        this.name = 'OutboundDeliveryError'
+    }
+}
+
+function estimateSerializedBytes(value: unknown): number {
+    try {
+        return Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8')
+    } catch {
+        return MAX_PENDING_LOSSLESS_BYTES + 1
+    }
+}
 
 function isTransientMaterializationError(error: unknown): boolean {
     if (!axios.isAxiosError(error)) {
@@ -281,6 +309,7 @@ export class ApiSessionClient extends EventEmitter {
     private agentStateChangedDuringAttempt = false
     private readonly pendingOutboundEvents: PendingOutboundEvent[] = []
     private didWarnPendingQueueFull = false
+    private didReportOutboundDeliveryFailure = false
 
     constructor(token: string, session: Session, options: ApiSessionClientOptions = {}) {
         super()
@@ -322,10 +351,12 @@ export class ApiSessionClient extends EventEmitter {
         this.terminalManager = new TerminalManager({
             sessionId: this.sessionId,
             getSessionPath: () => this.metadata?.path ?? null,
-            onReady: (payload) => this.socket.emit('terminal:ready', payload),
-            onOutput: (payload) => this.socket.emit('terminal:output', payload),
-            onExit: (payload) => this.socket.emit('terminal:exit', payload),
-            onError: (payload) => this.socket.emit('terminal:error', payload)
+            onReady: (payload) => this.emitSocketOrQueue('terminal:ready', [payload]),
+            onOutput: (payload) => {
+                if (this.socket.connected) this.socket.volatile.emit('terminal:output', payload)
+            },
+            onExit: (payload) => this.emitSocketOrQueue('terminal:exit', [payload]),
+            onError: (payload) => this.emitSocketOrQueue('terminal:error', [payload])
         })
 
         this.socket.on('connect', () => {
@@ -337,8 +368,9 @@ export class ApiSessionClient extends EventEmitter {
             }
             void this.backfillIfNeeded()
             this.hasConnectedOnce = true
+            this.drainPendingOutboundEvents()
             this.reconnectHandler?.()
-            this.socket.emit('session-alive', {
+            this.socket.volatile.emit('session-alive', {
                 sid: this.sessionId,
                 time: Date.now(),
                 thinking: false
@@ -351,6 +383,7 @@ export class ApiSessionClient extends EventEmitter {
 
         this.socket.on('disconnect', (reason) => {
             logger.debug('[API] Socket disconnected:', reason)
+            this.captureSocketSendBuffer()
             this.rpcHandlerManager.onSocketDisconnect()
             this.terminalManager.closeAll()
             if (this.hasConnectedOnce) {
@@ -666,37 +699,130 @@ export class ApiSessionClient extends EventEmitter {
         return false
     }
 
+    private emitSocketOrQueue(
+        event: string,
+        args: unknown[],
+        retention: PendingOutboundEvent['retention'] = 'lossless'
+    ): boolean {
+        return this.emitOrQueue(
+            () => (this.socket.emit as unknown as (event: string, ...args: unknown[]) => void)(event, ...args),
+            retention,
+            estimateSerializedBytes([event, ...args])
+        )
+    }
+
     private emitOrQueue(
         emit: () => void,
-        retention: PendingOutboundEvent['retention'] = 'lossless'
-    ): void {
+        retention: PendingOutboundEvent['retention'] = 'lossless',
+        estimatedBytes: number = 0
+    ): boolean {
         if (this.state === 'active') {
-            emit()
-            return
+            if (this.socket.connected) {
+                emit()
+                return true
+            } else {
+                return this.queuePendingOutboundEvent(emit, retention, estimatedBytes)
+            }
         }
         if (this.state === 'closed') {
-            return
+            return false
         }
 
+        return this.queuePendingOutboundEvent(emit, retention, estimatedBytes)
+    }
+
+    private queuePendingOutboundEvent(
+        emit: () => void,
+        retention: PendingOutboundEvent['retention'],
+        estimatedBytes: number
+    ): boolean {
         if (retention === 'droppable') {
-            const droppableCount = this.pendingOutboundEvents.reduce(
-                (count, event) => count + (event.retention === 'droppable' ? 1 : 0),
-                0
+            let droppableCount = this.pendingOutboundEvents.reduce(
+                (count, event) => count + (event.retention === 'droppable' ? 1 : 0), 0
             )
-            if (droppableCount >= MAX_PENDING_DROPPABLE_EVENTS) {
+            let droppableBytes = this.pendingOutboundEvents.reduce(
+                (bytes, event) => bytes + (event.retention === 'droppable' ? event.estimatedBytes : 0), 0
+            )
+            while (
+                droppableCount >= MAX_PENDING_DROPPABLE_EVENTS
+                || droppableBytes + estimatedBytes > MAX_PENDING_DROPPABLE_BYTES
+            ) {
                 const oldestDroppableIndex = this.pendingOutboundEvents.findIndex(
                     (event) => event.retention === 'droppable'
                 )
                 if (oldestDroppableIndex >= 0) {
-                    this.pendingOutboundEvents.splice(oldestDroppableIndex, 1)
+                    const [removed] = this.pendingOutboundEvents.splice(oldestDroppableIndex, 1)
+                    droppableCount -= 1
+                    droppableBytes -= removed?.estimatedBytes ?? 0
+                    continue
                 }
                 if (!this.didWarnPendingQueueFull) {
                     this.didWarnPendingQueueFull = true
                     logger.warn(`[API] Pending control event queue full for ${this.sessionId}; dropping oldest control event`)
                 }
+                return false
+            }
+        } else {
+            const losslessCount = this.pendingOutboundEvents.reduce(
+                (count, event) => count + (event.retention === 'lossless' ? 1 : 0), 0
+            )
+            const losslessBytes = this.pendingOutboundEvents.reduce(
+                (bytes, event) => bytes + (event.retention === 'lossless' ? event.estimatedBytes : 0), 0
+            )
+            if (
+                losslessCount >= MAX_PENDING_LOSSLESS_EVENTS
+                || losslessBytes + estimatedBytes > MAX_PENDING_LOSSLESS_BYTES
+            ) {
+                this.reportOutboundDeliveryFailure()
+                throw new OutboundDeliveryError()
             }
         }
-        this.pendingOutboundEvents.push({ emit, retention })
+        this.pendingOutboundEvents.push({ emit, retention, estimatedBytes })
+        return true
+    }
+
+    private reportOutboundDeliveryFailure(
+        reason = 'lossless outbound delivery queue is full while the Hub socket is disconnected'
+    ): void {
+        if (this.didReportOutboundDeliveryFailure) return
+        this.didReportOutboundDeliveryFailure = true
+        const failure = {
+            sessionId: this.sessionId,
+            reason
+        }
+        logger.warn(`[API] ${failure.reason} for ${this.sessionId}`, failure)
+        this.emit('outbound-delivery-failed', failure)
+    }
+
+    private drainPendingOutboundEvents(): void {
+        if (this.state !== 'active' || !this.socket.connected) return
+        const pendingEvents = this.pendingOutboundEvents.splice(0)
+        for (const pendingEvent of pendingEvents) {
+            pendingEvent.emit()
+        }
+    }
+
+    private captureSocketSendBuffer(): void {
+        const socket = this.socket as typeof this.socket & { sendBuffer?: BufferedSocketPacket[] }
+        const buffered = socket.sendBuffer
+        if (!Array.isArray(buffered) || buffered.length === 0) return
+
+        const packets = buffered.slice()
+        buffered.length = 0
+        for (const packet of packets) {
+            const event = packet.data?.[0]
+            if (typeof event !== 'string') {
+                this.reportOutboundDeliveryFailure()
+                continue
+            }
+            if (DROPPABLE_SOCKET_EVENTS.has(event)) continue
+            const args = packet.data?.slice(1) ?? []
+            this.queuePendingOutboundEvent(
+                () => (this.socket.emit as unknown as (event: string, ...args: unknown[]) => void)(event, ...args),
+                'lossless',
+                estimateSerializedBytes(packet.data)
+            )
+        }
     }
 
     onUserMessage(callback: (data: UserMessage, localId?: string) => void): void {
@@ -892,7 +1018,7 @@ export class ApiSessionClient extends EventEmitter {
         await this.backfillInFlight
     }
 
-    sendClaudeSessionMessage(body: RawJSONLines): void {
+    sendClaudeSessionMessage(body: RawJSONLines): boolean {
         let content: MessageContent
         // Origin timestamp (epoch ms) from the transcript entry's own `timestamp`,
         // forwarded only for agent messages so the hub can stamp created_at/invoked_at
@@ -936,13 +1062,16 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        this.emitOrQueue(() => {
-            this.socket.emit('message', {
-                sid: this.sessionId,
-                message: content,
-                ...(createdAt !== undefined ? { createdAt } : {})
-            })
-        })
+        const payload = {
+            sid: this.sessionId,
+            message: content,
+            ...(createdAt !== undefined ? { createdAt } : {})
+        }
+        const delivered = this.emitOrQueue(
+            () => this.socket.emit('message', payload),
+            'lossless',
+            estimateSerializedBytes(['message', payload])
+        )
 
         if (body.type === 'summary' && 'summary' in body && 'leafUuid' in body) {
             this.updateMetadata((metadata) => ({
@@ -953,6 +1082,7 @@ export class ApiSessionClient extends EventEmitter {
                 }
             }))
         }
+        return delivered
     }
 
     sendAgySessionMessage(
@@ -965,22 +1095,26 @@ export class ApiSessionClient extends EventEmitter {
         // to show — just the raw result. Carrying it here lets the web render a
         // command/path/args like the other flavors.
         toolCall?: { name: string; args: Record<string, unknown> }
-    ): void {
+    ): boolean {
         const isUser = entry.type === 'USER_INPUT'
         // agy appends its own sections (<ADDITIONAL_METADATA>, <USER_SETTINGS_CHANGE>)
         // after the request block, so only the extracted request may be rendered.
         const text = isUser ? (extractUserRequest(entry.content ?? '') ?? entry.content ?? '').trim() : undefined
 
         if (isUser && text) {
-            this.socket.emit('message', {
+            const payload = {
                 sid: this.sessionId,
                 message: {
                     role: 'user',
                     content: { type: 'text', text },
                     meta: { sentFrom: 'cli' }
                 }
-            })
-            return
+            }
+            return this.emitOrQueue(
+                () => this.socket.emit('message', payload),
+                'lossless',
+                estimateSerializedBytes(['message', payload])
+            )
         }
 
         // agy's structured entry types map to distinct chat renderings:
@@ -1017,19 +1151,29 @@ export class ApiSessionClient extends EventEmitter {
             // enriched by the scanner from the conversation DB.
             data = { type: 'agy_message', content: entry.content ?? '', model: entry.model }
         }
-        this.socket.emit('message', {
+        const payload = {
             sid: this.sessionId,
             message: {
                 role: 'agent',
                 content: { type: 'output', data },
                 meta: { sentFrom: 'cli' }
             }
-        })
+        }
+        return this.emitOrQueue(
+            () => this.socket.emit('message', payload),
+            'lossless',
+            estimateSerializedBytes(['message', payload])
+        )
     }
 
-    sendUserMessage(text: string, meta?: MessageMeta, localId?: string): void {
+    sendUserMessage(text: string, meta?: MessageMeta, localId?: string): boolean {
         if (!text) {
-            return
+            return true
+        }
+        if (localId && !this.socket.connected) {
+            const reason = 'lossless user-message delivery is unavailable while the Hub socket is disconnected'
+            this.reportOutboundDeliveryFailure(reason)
+            throw new OutboundDeliveryError()
         }
 
         const content: MessageContent = {
@@ -1044,26 +1188,30 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        this.emitOrQueue(() => {
-            this.socket.emit('message', {
-                sid: this.sessionId,
-                message: content,
-                localId
-            })
-            if (localId) this.socket.emit('messages-consumed', { sid: this.sessionId, localIds: [localId] })
-        })
+        const payload = { sid: this.sessionId, message: content, localId }
+        const consumed = localId ? { sid: this.sessionId, localIds: [localId] } : undefined
+        const delivered = this.emitOrQueue(() => {
+            this.socket.emit('message', payload)
+            if (consumed) this.socket.emit('messages-consumed', consumed)
+        }, 'lossless', estimateSerializedBytes(['message', payload, consumed]))
         this.notifyUserActivity()
+        return delivered
     }
 
-    syncNativeQueuedMessage(localId: string, text: string | null): void {
-        this.emitOrQueue(() => this.socket.emit('native-queue-message', { sid: this.sessionId, localId, text }))
+    syncNativeQueuedMessage(localId: string, text: string | null): boolean {
+        const payload = { sid: this.sessionId, localId, text }
+        return this.emitOrQueue(
+            () => this.socket.emit('native-queue-message', payload),
+            'lossless',
+            estimateSerializedBytes(['native-queue-message', payload])
+        )
     }
 
     notifyUserActivity(): void {
         void this.materialize()
     }
 
-    sendAgentMessage(body: unknown, localId?: string): void {
+    sendAgentMessage(body: unknown, localId?: string): boolean {
         const content = {
             role: 'agent',
             content: {
@@ -1074,14 +1222,12 @@ export class ApiSessionClient extends EventEmitter {
                 sentFrom: 'cli'
             }
         }
-        this.emitOrQueue(() => {
-            this.socket.emit('message', {
-                sid: this.sessionId,
-                message: content,
-                localId
-            })
-            if (localId) this.socket.emit('messages-consumed', { sid: this.sessionId, localIds: [localId] })
-        })
+        const payload = { sid: this.sessionId, message: content, localId }
+        const consumed = localId ? { sid: this.sessionId, localIds: [localId] } : undefined
+        return this.emitOrQueue(() => {
+            this.socket.emit('message', payload)
+            if (consumed) this.socket.emit('messages-consumed', consumed)
+        }, 'lossless', estimateSerializedBytes(['message', payload, consumed]))
     }
 
     sendSessionEvent(event: {
@@ -1110,7 +1256,7 @@ export class ApiSessionClient extends EventEmitter {
         summary: string
         tokensBefore?: number
         estimatedTokensAfter?: number
-    }, id?: string): void {
+    }, id?: string): boolean {
         const content = {
             role: 'agent',
             content: {
@@ -1120,12 +1266,15 @@ export class ApiSessionClient extends EventEmitter {
             }
         }
 
-        this.emitOrQueue(() => {
-            this.socket.emit('message', {
-                sid: this.sessionId,
-                message: content
-            })
-        }, event.type === 'message' || event.type === 'error' || event.type === 'compact-summary' ? 'lossless' : 'droppable')
+        const payload = { sid: this.sessionId, message: content }
+        const retention = event.type === 'message' || event.type === 'error' || event.type === 'compact-summary'
+            ? 'lossless' as const
+            : 'droppable' as const
+        return this.emitOrQueue(
+            () => this.socket.emit('message', payload),
+            retention,
+            estimateSerializedBytes(['message', payload])
+        )
     }
 
     emitAgentTerminalOutput(data: string): void {
@@ -1139,18 +1288,18 @@ export class ApiSessionClient extends EventEmitter {
         // high-frequency byte stream (spinners ~10Hz) to an empty room. On
         // subscribe, 'agent-terminal:refresh' flips this on and replays the local
         // buffer (see the handler), so nothing is lost.
-        if (!this.agentTerminalActive) return
+        if (!this.agentTerminalActive || !this.socket.connected) return
         const payload: TerminalOutputPayload = {
             sessionId: this.sessionId,
             terminalId: 'agent',
             data
         }
-        this.socket.emit('agent-terminal:output', payload)
+        this.socket.volatile.emit('agent-terminal:output', payload)
     }
 
     private emitAgentTerminalLocalReplay(): void {
-        if (!this.agentTerminalLocalBuffer) return
-        this.socket.emit('agent-terminal:output', {
+        if (!this.agentTerminalLocalBuffer || !this.socket.connected) return
+        this.socket.volatile.emit('agent-terminal:output', {
             sessionId: this.sessionId,
             terminalId: 'agent',
             data: this.agentTerminalLocalBuffer
@@ -1167,7 +1316,7 @@ export class ApiSessionClient extends EventEmitter {
         // New PTY → drop the previous screen from both the hub buffer and our
         // local copy so neither replays stale output.
         this.agentTerminalLocalBuffer = ''
-        this.socket.emit('agent-terminal:reset', { sessionId: this.sessionId })
+        this.emitSocketOrQueue('agent-terminal:reset', [{ sessionId: this.sessionId }], 'lossless')
     }
 
     /**
@@ -1227,16 +1376,16 @@ export class ApiSessionClient extends EventEmitter {
 
     /** Hub waits for this before mergeSessions on Cursor ACP reopen (tiann/hapi#939). */
     emitSessionReady(): void {
-        this.emitOrQueue(() => {
-            this.socket.emit('session-ready', {
-                sid: this.sessionId,
-                time: Date.now()
-            })
-        }, 'droppable')
+        const payload = { sid: this.sessionId, time: Date.now() }
+        this.emitOrQueue(
+            () => this.socket.emit('session-ready', payload),
+            'lossless',
+            estimateSerializedBytes(['session-ready', payload])
+        )
     }
 
-    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean }): void {
-        if (localIds.length === 0) return
+    emitMessagesConsumed(localIds: string[], options?: { clearQueuedThinkingGrace?: boolean; steered?: boolean }): boolean {
+        if (localIds.length === 0) return true
         // `clearQueuedThinkingGrace` is an opt-in signal for the hub to drop
         // the 15s queued-thinking grace immediately. Only synchronous handlers
         // that will never call `onThinkingChange(true)` (slash commands handled
@@ -1258,7 +1407,11 @@ export class ApiSessionClient extends EventEmitter {
         if (options?.steered) {
             payload.steered = true
         }
-        this.emitOrQueue(() => this.socket.emit('messages-consumed', payload))
+        return this.emitOrQueue(
+            () => this.socket.emit('messages-consumed', payload),
+            'lossless',
+            estimateSerializedBytes(['messages-consumed', payload])
+        )
     }
 
     /** Persist the durable pre-dispatch/restore state with a hub ACK. */
@@ -1278,22 +1431,27 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /** Persist a steer whose transport completed ambiguously; no consumed ACK. */
-    emitSteerIndeterminate(localIds: string[]): void {
-        if (localIds.length === 0) return
-        this.emitOrQueue(() => this.socket.emit('messages-indeterminate', {
-            sid: this.sessionId,
-            localIds
-        }))
+    emitSteerIndeterminate(localIds: string[]): boolean {
+        if (localIds.length === 0) return true
+        const payload = { sid: this.sessionId, localIds }
+        return this.emitOrQueue(
+            () => this.socket.emit('messages-indeterminate', payload),
+            'lossless',
+            estimateSerializedBytes(['messages-indeterminate', payload])
+        )
     }
 
-    sendSessionDeath(reason?: SessionEndReason, options?: { preserveUploads?: boolean }): void {
+    sendSessionDeath(reason?: SessionEndReason, options?: { preserveUploads?: boolean }): boolean {
         if (this.state === 'active') {
             if (options?.preserveUploads) preserveUploadDirOnExit(this.sessionId)
             else void cleanupUploadDir(this.sessionId)
         }
-        this.emitOrQueue(() => {
-            this.socket.emit('session-end', { sid: this.sessionId, time: Date.now(), reason })
-        })
+        const payload = { sid: this.sessionId, time: Date.now(), reason }
+        return this.emitOrQueue(
+            () => this.socket.emit('session-end', payload),
+            'lossless',
+            estimateSerializedBytes(['session-end', payload])
+        )
     }
 
     updateMetadata(handler: (metadata: Metadata) => Metadata): void {
@@ -1544,6 +1702,8 @@ export class ApiSessionClient extends EventEmitter {
         this.materializationRetryAbortController = null
         this.awaitingMaterializedConnection = false
         this.pendingOutboundEvents.length = 0
+        const buffered = (this.socket as typeof this.socket & { sendBuffer?: BufferedSocketPacket[] }).sendBuffer
+        if (Array.isArray(buffered)) buffered.length = 0
         this.rpcHandlerManager.onSocketDisconnect()
         this.terminalManager.closeAll()
         this.socket.disconnect()

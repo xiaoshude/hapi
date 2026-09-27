@@ -97,9 +97,14 @@ export class SharedCodexProjection {
             if (id) {
                 const firstInTurn = turnId ? [...this.turns].find(([, value]) => value === turnId)?.[0] : undefined;
                 if (turnId) this.turns.set(id, turnId);
-                await this.committed(id);
                 const text = inputText(item.content);
-                if (text) this.session.sendUserMessage(text, undefined, id);
+                if (text && this.session.sendUserMessage(text, undefined, id) === false) {
+                    throw new Error(`Failed to deliver Codex user message ${id}`);
+                }
+                // Commit only after the message has been accepted by the CLI
+                // transport. A bounded disconnected-transport failure must
+                // leave the native localId replayable on the next recovery.
+                await this.committed(id);
                 this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
                     ...(turnId && (!firstInTurn || firstInTurn === id) ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
                 }));

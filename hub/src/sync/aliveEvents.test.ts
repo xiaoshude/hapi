@@ -16,7 +16,7 @@ function createPublisher(events: SyncEvent[]): EventPublisher {
 }
 
 describe('alive incremental events', () => {
-    it('replays durable immediate prompts on every attach until consumed', () => {
+    it('replays durable immediate prompts once per inactive-to-active attach, not every heartbeat', () => {
         const store = new Store(':memory:')
         const emitted: Array<{ body?: { t?: string; message?: { localId?: string | null } } }> = []
         const io = {
@@ -34,15 +34,33 @@ describe('alive incremental events', () => {
             expect(emitted).toEqual([])
 
             engine.handleSessionAlive({ sid: session.id, time: Date.now() })
+            engine.handleSessionAttached(session.id)
+            expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
+                'queued-before-attach'
+            ])
+
             engine.handleSessionAlive({ sid: session.id, time: Date.now() + 1 })
+            expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
+                'queued-before-attach'
+            ])
+
+            engine.handleSessionAlive({ sid: session.id, time: Date.now() + 5_000 })
+            engine.handleSessionAttached(session.id)
+            engine.handleSessionAlive({ sid: session.id, time: Date.now() + 5_001 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
                 'queued-before-attach', 'queued-before-attach'
             ])
 
             store.messages.markMessagesInvoked(session.id, ['queued-before-attach'], Date.now())
-            engine.handleSessionAlive({ sid: session.id, time: Date.now() + 2 })
+            engine.handleSessionEnd({ sid: session.id, time: Date.now() + 2 })
+            emitted.length = 2
+            store.messages.addMessage(session.id, { text: 'queued after reconnect' }, 'queued-after-reconnect')
+
+            engine.handleSessionAttached(session.id)
+            engine.handleSessionAlive({ sid: session.id, time: Date.now() + 3 })
+            engine.handleSessionAlive({ sid: session.id, time: Date.now() + 4 })
             expect(emitted.map((update) => update.body?.message?.localId)).toEqual([
-                'queued-before-attach', 'queued-before-attach'
+                'queued-before-attach', 'queued-before-attach', 'queued-after-reconnect'
             ])
         } finally { engine.stop() }
     })

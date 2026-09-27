@@ -54,6 +54,29 @@ function reasoningTextOf(message: { content: unknown }): string {
 }
 
 describe('cli session handlers', () => {
+    it('reports one attachment per session per socket while forwarding every heartbeat', () => {
+        const store = new Store(':memory:')
+        const session = store.sessions.getOrCreateSession('heartbeat-attach', {}, null, 'default')
+        const socket = new FakeSocket()
+        const alive: string[] = []
+        const attached: string[] = []
+
+        registerSessionHandlers(socket as unknown as CliSocketWithData, {
+            store,
+            resolveSessionAccess: () => ({ ok: true, value: session as StoredSession }),
+            emitAccessError: () => {},
+            onSessionAlive: (payload) => alive.push(payload.sid),
+            onSessionAttached: (payload) => attached.push(payload.sid)
+        })
+
+        socket.trigger('session-alive', { sid: session.id, time: 1 })
+        socket.trigger('session-alive', { sid: session.id, time: 2 })
+
+        expect(alive).toEqual([session.id, session.id])
+        expect(attached).toEqual([session.id])
+        store.close()
+    })
+
     it.each([undefined, 'terminated', 'error'] as const)('preserves shared Codex pending input on execution exit (%s)', reason => {
         const store = new Store(':memory:')
         const session = store.sessions.getOrCreateSession('shared-end', { flavor: 'codex', capabilities: { concurrentClients: true } }, null, 'default')

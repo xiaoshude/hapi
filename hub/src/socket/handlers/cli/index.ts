@@ -43,6 +43,7 @@ export type CliHandlersDeps = {
     rpcRegistry: RpcRegistry
     terminalRegistry: TerminalRegistry
     onSessionAlive?: (payload: SessionAlivePayload) => void
+    onSessionAttached?: (payload: SessionAlivePayload) => void
     onSessionReady?: (payload: SessionReadyPayload) => void
     onSessionEnd?: (payload: SessionEndPayload) => void
     onMachineAlive?: (payload: MachineAlivePayload) => void
@@ -54,7 +55,7 @@ export type CliHandlersDeps = {
 }
 
 export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlersDeps): void {
-    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionReady, onSessionEnd, onMachineAlive, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { io, store, rpcRegistry, terminalRegistry, onSessionAlive, onSessionAttached, onSessionReady, onSessionEnd, onMachineAlive, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
     const terminalNamespace = io.of('/terminal')
     const namespace = typeof socket.data.namespace === 'string' ? socket.data.namespace : null
 
@@ -112,6 +113,7 @@ export function registerCliHandlers(socket: CliSocketWithData, deps: CliHandlers
         resolveSessionAccess,
         emitAccessError,
         onSessionAlive,
+        onSessionAttached,
         onSessionReady,
         onSessionEnd,
         onWebappEvent,

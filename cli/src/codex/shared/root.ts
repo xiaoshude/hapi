@@ -67,6 +67,7 @@ export class SharedCodexRoot {
     private closing?: Promise<void>;
     private readonly controls = new Set<Promise<unknown>>();
     private reconnecting = false;
+    private pendingNotice?: string;
     private settings: RuntimeSettings = {};
     private settingsNative: Record<string, unknown> = {};
     private settingsNotification?: Record<string, unknown>;
@@ -108,7 +109,19 @@ export class SharedCodexRoot {
                 this.publishPlan();
             }
             const modelAtReceipt = record(params).threadId === this.threadId ? this.settings.model ?? undefined : undefined;
-            this.notifications = this.notifications.then(() => this.notification(method, params, modelAtReceipt)).catch(error => logger.debug('[Codex shared] projection', error));
+            this.notifications = this.notifications.then(() => this.notification(method, params, modelAtReceipt)).catch(error => {
+                const detail = error instanceof Error ? error.message : String(error)
+                // A native localId is committed only after projection delivery
+                // succeeds. Surface a failed delivery to the user so the
+                // queued native message remains actionable instead of turning
+                // into a debug-only, apparently successful notification.
+                try {
+                    this.notice(`Message not confirmed: ${detail}. Inspect the queue before retrying.`)
+                } catch (noticeError) {
+                    logger.warn('[Codex shared] projection failure notice could not be delivered', noticeError)
+                }
+                logger.debug('[Codex shared] projection', error)
+            });
         });
         this.client.setTransportAbandonedHandler(() => { void this.reconnect(); });
         this.session.onUserMessage((message, localId) => {
@@ -131,6 +144,7 @@ export class SharedCodexRoot {
             return ['rejected', 'canceled', 'released'].includes(this.queue.state(id) ?? '');
         });
         this.session.onReconnect(() => {
+            this.flushPendingNotice();
             if (!this.threadId || this.closed || this.stopping) return;
             // An emitted socket packet is not a durable hub acknowledgement.
             // Replay final native history with stable IDs after every reconnect.
@@ -511,7 +525,29 @@ export class SharedCodexRoot {
             developerInstructions: getCodexSystemPrompt(),
             config: { ...record(sandbox.config), model_reasoning_effort: this.settings.modelReasoningEffort ?? undefined } };
     }
-    private notice(message: string): void { this.session.sendSessionEvent({ type: 'message', message }); }
+    private notice(message: string): void {
+        try {
+            if (this.session.sendSessionEvent({ type: 'message', message }) === false) {
+                this.pendingNotice = message;
+            } else {
+                this.pendingNotice = undefined;
+            }
+        } catch (error) {
+            this.pendingNotice = message;
+            logger.warn('[Codex shared] deferring notice until HAPI reconnect', error);
+        }
+    }
+    private flushPendingNotice(): void {
+        const message = this.pendingNotice;
+        if (!message) return;
+        try {
+            if (this.session.sendSessionEvent({ type: 'message', message }) !== false) {
+                this.pendingNotice = undefined;
+            }
+        } catch (error) {
+            logger.warn('[Codex shared] deferred notice still unavailable', error);
+        }
+    }
     private async newConversation(): Promise<SharedCodexRoot> {
         const child = await this.host.create('thread/start', this.freshParams());
         await child.initialSettings({ collaborationMode: this.settings.collaborationMode }); return child;

@@ -6,8 +6,11 @@ const socketHarness = vi.hoisted(() => ({
         connected: boolean
         connectCalls: number
         connectImmediately: boolean
+        blockAck: boolean
+        ackRejected: boolean
+        pendingAckReject: ((error: unknown) => void) | null
         emitted: Array<{ event: string; args: unknown[] }>
-        sendBuffer: Array<{ data?: unknown[] }>
+        sendBuffer: Array<{ id?: number | string; data?: unknown[] }>
         listeners: Map<string, Array<(...args: any[]) => void>>
         trigger: (event: string, ...args: any[]) => void
         triggerConnect: () => void
@@ -25,8 +28,11 @@ vi.mock('socket.io-client', () => ({
             connected: false,
             connectCalls: 0,
             connectImmediately: true,
+            blockAck: false,
+            ackRejected: false,
+            pendingAckReject: null,
             emitted: [] as Array<{ event: string; args: unknown[] }>,
-            sendBuffer: [] as Array<{ data?: unknown[] }>,
+            sendBuffer: [] as Array<{ id?: number | string; data?: unknown[] }>,
             listeners: new Map<string, Array<(...args: any[]) => void>>(),
             trigger: () => {},
             triggerConnect: () => {},
@@ -35,6 +41,15 @@ vi.mock('socket.io-client', () => ({
         state.trigger = (event: string, ...args: any[]) => {
             for (const listener of state.listeners.get(event) ?? []) {
                 listener(...args)
+            }
+            // Socket.IO invokes ACK callbacks with a disconnect error after
+            // the disconnect listeners run when captureSocketSendBuffer has
+            // removed a buffered packet.
+            if (event === 'disconnect' && state.pendingAckReject) {
+                const reject = state.pendingAckReject
+                state.pendingAckReject = null
+                state.ackRejected = true
+                reject(new Error('socket has been disconnected'))
             }
         }
         const triggerConnect = () => {
@@ -65,7 +80,12 @@ vi.mock('socket.io-client', () => ({
                 return socket
             },
             emitWithAck: async () => ({}),
-            timeout: () => ({ emitWithAck: async () => ({}) }),
+            timeout: () => ({ emitWithAck: async () => {
+                if (!state.blockAck) return {}
+                return await new Promise<unknown>((_resolve, reject) => {
+                    state.pendingAckReject = reject
+                })
+            } }),
             connect: () => {
                 state.connectCalls += 1
                 if (state.connectImmediately) {
@@ -499,8 +519,14 @@ describe('ApiSessionClient lazy materialization', () => {
         const socket = socketHarness.sockets[0]
         if (!socket) throw new Error('expected socket')
         socket.connected = false
+        const failures: unknown[] = []
+        client.on('outbound-delivery-failed', (failure) => failures.push(failure))
         socket.sendBuffer.push(
             { data: ['agent-terminal:output', { data: 'spinner' }] },
+            // This is the shape Socket.IO uses for an emitWithAck packet. It
+            // must be abandoned, never replayed as a bare event: that would
+            // lose packet.id and could apply a timed-out mutation on reconnect.
+            { id: 7, data: ['messages-steer-state', { sid: 'session', state: 'dispatching' }] },
             { data: ['message', { sid: 'session', message: { role: 'agent' } }] }
         )
 
@@ -510,7 +536,30 @@ describe('ApiSessionClient lazy materialization', () => {
         socket.triggerConnect()
 
         expect(socket.emitted.filter((entry) => entry.event === 'agent-terminal:output')).toHaveLength(0)
+        expect(socket.emitted.filter((entry) => entry.event === 'messages-steer-state')).toHaveLength(0)
         expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(1)
+        expect(failures).toHaveLength(1)
+        client.close()
+    })
+
+    it('settles an abandoned ACK as a disconnect failure without replaying its mutation', async () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = true
+        socket.blockAck = true
+
+        const result = client.setSteerDeliveryState(['local-1'], 'dispatching')
+        await vi.waitFor(() => expect(socket.pendingAckReject).not.toBeNull())
+        socket.sendBuffer.push({ id: 7, data: ['messages-steer-state', { sid: 'session', state: 'dispatching' }] })
+        socket.connected = false
+        socket.trigger('disconnect', 'transport close')
+
+        await expect(result).resolves.toBe(false)
+        expect(socket.ackRejected).toBe(true)
+        socket.triggerConnect()
+        expect(socket.emitted.filter((entry) => entry.event === 'messages-steer-state')).toHaveLength(0)
         client.close()
     })
 

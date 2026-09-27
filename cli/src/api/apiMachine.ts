@@ -634,7 +634,10 @@ export class ApiMachineClient {
     private startKeepAlive(): void {
         this.stopKeepAlive()
         const emitAlive = () => {
-            this.socket.emit('machine-alive', {
+            // This is a replaceable heartbeat. Volatile prevents Socket.IO
+            // from retaining one packet for every tick during a long outage;
+            // the next heartbeat supersedes the previous one.
+            this.socket.volatile.emit('machine-alive', {
                 machineId: this.machine.id,
                 time: Date.now(),
                 health: collectMachineHealth()

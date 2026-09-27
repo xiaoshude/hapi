@@ -796,7 +796,13 @@ export class ApiSessionClient extends EventEmitter {
             reason
         }
         logger.warn(`[API] ${failure.reason} for ${this.sessionId}`, failure)
-        this.emit('outbound-delivery-failed', failure)
+        try {
+            this.emit('outbound-delivery-failed', failure)
+        } catch (error) {
+            // A diagnostic listener must not prevent Socket.IO's disconnect
+            // lifecycle from returning to its own ACK cleanup.
+            logger.warn(`[API] outbound-delivery-failed listener failed for ${this.sessionId}`, error)
+        }
     }
 
     private drainPendingOutboundEvents(): void {
@@ -828,11 +834,21 @@ export class ApiSessionClient extends EventEmitter {
             }
             if (DROPPABLE_SOCKET_EVENTS.has(event)) continue
             const args = packet.data?.slice(1) ?? []
-            this.queuePendingOutboundEvent(
-                () => (this.socket.emit as unknown as (event: string, ...args: unknown[]) => void)(event, ...args),
-                'lossless',
-                estimateSerializedBytes(packet.data)
-            )
+            try {
+                this.queuePendingOutboundEvent(
+                    () => (this.socket.emit as unknown as (event: string, ...args: unknown[]) => void)(event, ...args),
+                    'lossless',
+                    estimateSerializedBytes(packet.data)
+                )
+            } catch (error) {
+                // Do not let one over-budget buffered packet abort this
+                // listener: Socket.IO must still run _clearAcks(), which
+                // rejects any ACK packet removed above.
+                logger.warn(`[API] Failed to recover buffered lossless event ${event} for ${this.sessionId}`, error)
+                this.reportOutboundDeliveryFailure(
+                    'a buffered lossless outbound event exceeded bounded recovery capacity; reconcile the operation'
+                )
+            }
         }
     }
 

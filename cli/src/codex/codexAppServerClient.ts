@@ -415,7 +415,7 @@ export class CodexAppServerClient extends JsonLineParser {
     async resumeThread(params: ThreadResumeParams, options?: { signal?: AbortSignal }): Promise<ThreadResumeResponse> {
         const response = await this.sendRequest('thread/resume', params, {
             signal: options?.signal,
-            timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
+            timeoutMs: CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS
         });
         return response as ThreadResumeResponse;
     }
@@ -423,7 +423,7 @@ export class CodexAppServerClient extends JsonLineParser {
     async forkThread(params: ThreadForkParams, options?: { signal?: AbortSignal }): Promise<ThreadForkResponse> {
         const response = await this.sendRequest('thread/fork', params, {
             signal: options?.signal,
-            timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
+            timeoutMs: CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS
         });
         return response as ThreadForkResponse;
     }
@@ -443,7 +443,7 @@ export class CodexAppServerClient extends JsonLineParser {
     async readThread(params: ThreadReadParams, options?: { signal?: AbortSignal }): Promise<ThreadReadResponse> {
         const response = await this.sendRequest('thread/read', params, {
             signal: options?.signal,
-            timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
+            timeoutMs: CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS
         });
         return response as ThreadReadResponse;
     }

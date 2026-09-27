@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { CODEX_RESUME_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
 import type { Server } from 'socket.io'
 import type { RpcRegistry } from '../socket/rpcRegistry'
 import { RpcGateway, RpcTargetMissingError } from './rpcGateway'
@@ -55,6 +56,36 @@ describe('RpcGateway RPC timeouts', () => {
         const { gateway, timeouts } = createGateway()
 
         await gateway.listMachineDirectory('machine-1', 'C:\\workspace')
+
+        expect(timeouts).toEqual([30_000])
+    })
+
+    it('uses an extended RPC timeout for Codex thread resumes', async () => {
+        const { gateway, timeouts } = createGateway()
+
+        await gateway.spawnSession(
+            'machine-1', '/workspace', 'codex', undefined, undefined, undefined,
+            undefined, undefined, 'codex-thread-id'
+        )
+
+        expect(timeouts).toEqual([CODEX_RESUME_RPC_TIMEOUT_MS])
+    })
+
+    it('keeps the default RPC timeout for new Codex sessions', async () => {
+        const { gateway, timeouts } = createGateway()
+
+        await gateway.spawnSession('machine-1', '/workspace', 'codex')
+
+        expect(timeouts).toEqual([30_000])
+    })
+
+    it('keeps the default RPC timeout when resuming another agent', async () => {
+        const { gateway, timeouts } = createGateway()
+
+        await gateway.spawnSession(
+            'machine-1', '/workspace', 'claude', undefined, undefined, undefined,
+            undefined, undefined, 'claude-session-id'
+        )
 
         expect(timeouts).toEqual([30_000])
     })

@@ -12,6 +12,15 @@ const LedgerSchema = z.record(z.string(), z.object({
 }));
 export type QueueInput = z.infer<typeof InputSchema>;
 type Entry = z.infer<typeof LedgerSchema>[string];
+type ExpectedTurnIdProvider = (() => string | undefined) & {
+    refresh?: () => Promise<string | undefined>;
+};
+type ExpectedTurnId = string | ExpectedTurnIdProvider;
+
+function isExpectedTurnIdMismatch(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /expected active turn id.*(?:mismatch|but found)|active turn id mismatch/iu.test(message);
+}
 
 /** Native queue is the only drainer. The ledger records uncertainty, not a second queue. */
 export class SharedCodexQueue {
@@ -22,7 +31,8 @@ export class SharedCodexQueue {
         private readonly file: string, private readonly consumed: (ids: string[], steered?: boolean) => void,
         private readonly uncertain: (ids: string[]) => void,
         private readonly mirror?: (id: string, input: QueueInput | null) => void,
-        private readonly requeued?: (ids: string[]) => Promise<unknown>) {}
+        private readonly requeued?: (ids: string[]) => Promise<unknown>,
+        private readonly dispatching?: (ids: string[]) => Promise<unknown>) {}
 
     async load(): Promise<void> {
         try { this.entries = LedgerSchema.parse(JSON.parse(await readFile(this.file, 'utf8'))); }
@@ -219,7 +229,7 @@ export class SharedCodexQueue {
         });
     }
 
-    steer(id: string, expectedTurnId: string, freshInput?: QueueInput): Promise<{ steered: boolean; indeterminate?: boolean; error?: string }> {
+    steer(id: string, expectedTurnId: ExpectedTurnId, freshInput?: QueueInput): Promise<{ steered: boolean; indeterminate?: boolean; error?: string }> {
         return this.serial(async () => {
             let entry = this.entries[id];
             if (entry?.state === 'consumed') return { steered: false, error: 'Message already consumed' };
@@ -238,24 +248,95 @@ export class SharedCodexQueue {
             } else if (freshInput) {
                 entry = { input: freshInput, state: 'unknown' }; this.entries[id] = entry; await this.save();
             } else return { steered: false, error: 'Message not queued' };
-            try {
-                await this.client.request('turn/steer', { threadId: this.threadId, expectedTurnId, input: entry.input, clientUserMessageId: id });
-                entry.state = 'consumed'; await this.save(); this.consumed([id], true); return { steered: true };
-            } catch (error) {
-                if (this.state(id) === 'consumed') return { steered: true };
-                if (isIndeterminateError(error)) { this.uncertain([id]); return { steered: false, indeterminate: true }; }
-                // Definitely rejected; restoring a removed queued item is safe. Never restore an unknown dispatch.
-                if (!freshInput) {
-                    try {
-                        const response = z.object({ queuedSubmission: SubmissionSchema }).parse(await this.client.request('thread/queue/add', {
-                            threadId: this.threadId, input: entry.input, clientUserMessageId: id
-                        }));
-                        if (entry.state !== 'consumed') { entry.state = 'queued'; entry.nativeId = response.queuedSubmission.id; }
-                    } catch { if (this.state(id) !== 'consumed') { entry.state = 'unknown'; this.uncertain([id]); } }
-                } else entry.state = 'rejected';
-                await this.save(); return { steered: false, error: error instanceof Error ? error.message : String(error) };
+            const turnIdAtRequest = () => typeof expectedTurnId === 'function' ? expectedTurnId() : expectedTurnId;
+            const refreshTurnId = typeof expectedTurnId === 'function' ? expectedTurnId.refresh : undefined;
+            let activeTurnId: string | undefined;
+            if (refreshTurnId) {
+                try { activeTurnId = await refreshTurnId(); }
+                catch { return await this.restoreAfterRejectedSteer(id, entry, freshInput, 'Active turn lookup failed'); }
+            } else {
+                activeTurnId = turnIdAtRequest();
             }
+            if (!activeTurnId) {
+                return await this.restoreAfterRejectedSteer(id, entry, freshInput, 'No active turn');
+            }
+            if (this.dispatching) {
+                let persisted = false;
+                try { persisted = await this.dispatching([id]) === true; } catch { /* restore without dispatch */ }
+                if (!persisted) {
+                    return await this.restoreAfterRejectedSteer(id, entry, freshInput, 'Steer state could not be persisted');
+                }
+            }
+
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                    await this.client.request('turn/steer', {
+                        threadId: this.threadId,
+                        expectedTurnId: activeTurnId,
+                        input: entry.input,
+                        clientUserMessageId: id
+                    });
+                    entry.state = 'consumed'; await this.save(); this.consumed([id], true); return { steered: true };
+                } catch (error) {
+                    if (this.state(id) === 'consumed') return { steered: true };
+                    if (isIndeterminateError(error)) { this.uncertain([id]); return { steered: false, indeterminate: true }; }
+
+                    // A JSON-RPC active-turn mismatch is a definite rejection,
+                    // not an unknown dispatch. The queue row is already removed;
+                    // retry that same localId once if the live turn advanced.
+                    if (attempt === 0 && isExpectedTurnIdMismatch(error)) {
+                        let latestTurnId = turnIdAtRequest();
+                        if ((!latestTurnId || latestTurnId === activeTurnId) && refreshTurnId) {
+                            try {
+                                const refreshedTurnId = await refreshTurnId();
+                                const notifiedTurnId = turnIdAtRequest();
+                                latestTurnId = notifiedTurnId && notifiedTurnId !== activeTurnId
+                                    ? notifiedTurnId
+                                    : refreshedTurnId;
+                            } catch {
+                                latestTurnId = undefined;
+                            }
+                        }
+                        if (latestTurnId && latestTurnId !== activeTurnId) {
+                            activeTurnId = latestTurnId;
+                            continue;
+                        }
+                    }
+                    return await this.restoreAfterRejectedSteer(
+                        id,
+                        entry,
+                        freshInput,
+                        error instanceof Error ? error.message : String(error)
+                    );
+                }
+            }
+            return { steered: false, indeterminate: true };
         });
+    }
+
+    private async restoreAfterRejectedSteer(id: string, entry: Entry, freshInput: QueueInput | undefined,
+        error: string): Promise<{ steered: false; indeterminate?: boolean; error?: string }> {
+        // The native turn explicitly rejected the steer, so restoring the
+        // existing localId to the ordinary queue is safe. Never do this for a
+        // transport-indeterminate request; that path returns above.
+        if (!freshInput) {
+            try {
+                const response = z.object({ queuedSubmission: SubmissionSchema }).parse(await this.client.request('thread/queue/add', {
+                    threadId: this.threadId, input: entry.input, clientUserMessageId: id
+                }));
+                if (entry.state !== 'consumed') { entry.state = 'queued'; entry.nativeId = response.queuedSubmission.id; }
+                await this.save();
+                if (this.requeued && await this.requeued([id]) === false) {
+                    if (this.state(id) !== 'consumed') { entry.state = 'unknown'; await this.save(); this.uncertain([id]); }
+                    return { steered: false, indeterminate: true, error };
+                }
+            } catch {
+                if (this.state(id) !== 'consumed') { entry.state = 'unknown'; await this.save(); this.uncertain([id]); }
+                return { steered: false, indeterminate: true, error };
+            }
+        } else entry.state = 'rejected';
+        await this.save();
+        return { steered: false, error };
     }
 
     async flush(): Promise<void> { await this.operations.catch(() => {}); await this.writes; }

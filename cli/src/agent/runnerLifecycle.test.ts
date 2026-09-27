@@ -78,14 +78,14 @@ describe('createRunnerLifecycle', () => {
     // --- markCrash sets reason to 'error' but not explicit ---
 
     describe('markCrash', () => {
-        it('sets sessionEndReason to error via sendSessionDeath during cleanup', async () => {
+        it('preserves pending work on crash rather than sending a terminal session-end', async () => {
             const session = createMockApiSession();
             const lc = createRunnerLifecycle({ session, logTag: 'test' });
             lc.markCrash(new Error('fatal'));
 
             // cleanup triggers sendSessionDeath — verify 'error' reason
             await lc.cleanup();
-            expect(session.sendSessionDeath).toHaveBeenCalledWith('error');
+            expect(session.sendSessionDeath).not.toHaveBeenCalled();
         });
     });
 
@@ -137,7 +137,7 @@ describe('createRunnerLifecycle', () => {
 // uncaught exception) reassign the reason before archive metadata is
 // written.
 describe('createRunnerLifecycle archiveReason defaults (tiann/hapi#914)', () => {
-    it('uses Hub restart as the default archiveReason when no override is applied', async () => {
+    it('preserves a resumable session on external process termination without inventing a Hub restart', async () => {
         const session = createMockApiSessionWithMetadataCapture()
         const lifecycle = createRunnerLifecycle({
             session,
@@ -148,9 +148,10 @@ describe('createRunnerLifecycle archiveReason defaults (tiann/hapi#914)', () => 
 
         expect(session.metadataWrites).toHaveLength(1)
         expect(session.metadataWrites[0]).toMatchObject({
-            lifecycleState: 'archived',
-            archivedBy: 'cli',
-            archiveReason: 'Hub restart'
+            lifecycleState: 'running',
+            archiveReason: undefined,
+            archivedBy: undefined,
+            lastProcessExit: { reason: 'Process terminated', at: expect.any(Number) }
         })
     })
 
@@ -180,7 +181,8 @@ describe('createRunnerLifecycle archiveReason defaults (tiann/hapi#914)', () => 
         await lifecycle.cleanup()
 
         expect(session.metadataWrites[0]).toMatchObject({
-            archiveReason: 'Session crashed'
+            lifecycleState: 'running',
+            lastProcessExit: { reason: 'Session crashed', at: expect.any(Number) }
         })
     })
 
@@ -219,5 +221,18 @@ describe('createRunnerLifecycle archiveReason defaults (tiann/hapi#914)', () => 
         expect(session.metadataWrites[0]).toMatchObject({
             archiveReason: 'User terminated'
         })
+    })
+})
+
+describe('process termination preserves archive decisions', () => {
+    it('does not reopen a concurrently archived row', async () => {
+        const writes: Array<Record<string, unknown>> = []
+        const session = createMockApiSession()
+        session.updateMetadata = vi.fn(fn => {
+            const next = fn({ path: '/tmp', host: 'test', lifecycleState: 'archived', archiveReason: 'User terminated', archivedBy: 'web' })
+            writes.push(next)
+        })
+        await createRunnerLifecycle({ session, logTag: 'test' }).cleanup()
+        expect(writes[0]).toMatchObject({ lifecycleState: 'archived', archiveReason: 'User terminated', archivedBy: 'web' })
     })
 })

@@ -4,6 +4,10 @@ import WebSocket from 'ws';
 import { logger } from '@/ui/logger';
 import { JsonLineParser } from '@/utils/jsonLineParser';
 import { killProcessByChildProcess } from '@/utils/process';
+import {
+    CODEX_HISTORY_REQUEST_TIMEOUT_MS,
+    CODEX_INTERACTIVE_REQUEST_TIMEOUT_MS
+} from '@hapi/protocol/codexTimeouts';
 import type {
     CollaborationModeListResponse,
     InitializeParams,
@@ -79,6 +83,13 @@ export function isIndeterminateError(error: unknown): boolean {
     return typeof error === 'object' && error !== null
         && (error as Record<symbol, unknown>)[INDETERMINATE_SYMBOL] === true;
 }
+
+const HISTORY_REQUEST_METHODS = new Set([
+    'thread/read',
+    'thread/resume',
+    'thread/fork',
+    'thread/turns/list',
+]);
 
 type CodexAppServerClientOptions = {
     cwd?: string;
@@ -204,6 +215,8 @@ export class CodexAppServerClient extends JsonLineParser {
     private protocolError: Error | null = null;
 
     static readonly DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
+    static readonly INTERACTIVE_REQUEST_TIMEOUT_MS = CODEX_INTERACTIVE_REQUEST_TIMEOUT_MS;
+    static readonly HISTORY_REQUEST_TIMEOUT_MS = CODEX_HISTORY_REQUEST_TIMEOUT_MS;
 
     constructor(private readonly options: CodexAppServerClientOptions = {}) {
         super();
@@ -339,8 +352,14 @@ export class CodexAppServerClient extends JsonLineParser {
         this.writePayload({ id, result });
     }
 
-    async request<T = unknown>(method: string, params?: unknown): Promise<T> {
-        return await this.sendRequest(method, params, { timeoutMs: 20_000 }) as T;
+    async request<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T> {
+        // These operations may need to replay or materialize a long persisted
+        // conversation before the app-server can return a response. Keep the
+        // short deadline for interactive RPCs that should acknowledge quickly.
+        const timeoutMs = options?.timeoutMs ?? (HISTORY_REQUEST_METHODS.has(method)
+            ? CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS
+            : CodexAppServerClient.INTERACTIVE_REQUEST_TIMEOUT_MS);
+        return await this.sendRequest(method, params, { timeoutMs }) as T;
     }
 
     async initialize(params: InitializeParams): Promise<InitializeResponse> {

@@ -48,6 +48,18 @@ function fakeChild() {
     });
 }
 
+async function connectedClientWithWritableStdin() {
+    const child = fakeChild();
+    child.stdin.write = vi.fn((_data: unknown, callback?: (error?: Error | null) => void) => {
+        callback?.();
+        return true;
+    });
+    spawnMock.mockReturnValue(child);
+    const client = new CodexAppServerClient({ cwd: '/neutral-home' });
+    await client.connect();
+    return { child, client };
+}
+
 function deferred<T>() {
     let resolve!: (value: T | PromiseLike<T>) => void;
     const promise = new Promise<T>((resolvePromise) => {
@@ -283,4 +295,91 @@ describe('CodexAppServerClient process cwd', () => {
         expect(newChild.stdin.write).not.toHaveBeenCalled();
         await client.disconnect();
     });
+});
+
+describe('CodexAppServerClient history request timeouts', () => {
+    beforeEach(() => {
+        execFileSyncMock.mockClear();
+        spawnMock.mockReset();
+    });
+
+    it.each([
+        'thread/read',
+        'thread/resume',
+        'thread/fork',
+        'thread/turns/list',
+    ])(
+        'allows %s to finish after the interactive request deadline', async method => {
+            const { child, client } = await connectedClientWithWritableStdin();
+            vi.useFakeTimers();
+
+            try {
+                const pending = client.request(method, { threadId: 'large-thread' });
+                const response = pending.then(
+                    value => ({ value }),
+                    error => ({ error })
+                );
+                const payload = JSON.parse(child.stdin.write.mock.calls.at(-1)?.[0] as string);
+
+                await vi.advanceTimersByTimeAsync(20_001);
+                child.stdout.emit('data', Buffer.from(JSON.stringify({
+                    id: payload.id,
+                    result: { threadId: 'large-thread' }
+                }) + '\n'));
+
+                expect(await response).toEqual({ value: { threadId: 'large-thread' } });
+            } finally {
+                vi.useRealTimers();
+                await client.disconnect();
+            }
+        }
+    );
+
+    it('bounds a stalled history request at its dedicated timeout', async () => {
+        const { child, client } = await connectedClientWithWritableStdin();
+        vi.useFakeTimers();
+
+        try {
+            const pending = client.request('thread/resume', { threadId: 'stalled-thread' });
+            const rejected = pending.then(
+                value => ({ value }),
+                error => ({ error })
+            );
+            await vi.advanceTimersByTimeAsync(CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS);
+            const result = await rejected;
+            if (!('error' in result)) throw new Error('Expected the stalled history request to time out');
+            expect(result.error).toBeInstanceOf(Error);
+            expect((result.error as Error).message).toContain(
+                `timed out after ${CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
+            );
+        } finally {
+            vi.useRealTimers();
+            await client.disconnect();
+        }
+    });
+
+    it.each(['thread/start', 'thread/compact/start', 'turn/start'])(
+        'keeps %s on the interactive deadline', async method => {
+            const { child, client } = await connectedClientWithWritableStdin();
+            vi.useFakeTimers();
+
+            try {
+                const pending = client.request(method, { threadId: 'quick-thread' });
+                const rejected = pending.then(
+                    value => ({ value }),
+                    error => ({ error })
+                );
+                await vi.advanceTimersByTimeAsync(CodexAppServerClient.INTERACTIVE_REQUEST_TIMEOUT_MS);
+                const result = await rejected;
+                if (!('error' in result)) throw new Error('Expected the interactive request to time out');
+                expect(result.error).toBeInstanceOf(Error);
+                expect((result.error as Error).message).toContain(
+                    `timed out after ${CodexAppServerClient.INTERACTIVE_REQUEST_TIMEOUT_MS}ms`
+                );
+            } finally {
+                vi.useRealTimers();
+                await client.disconnect();
+            }
+        }
+    );
 });

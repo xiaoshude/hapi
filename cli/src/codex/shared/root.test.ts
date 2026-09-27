@@ -4,6 +4,7 @@ import type { ApiSessionClient } from '@/api/apiSession';
 import type { AgentState, Metadata } from '@/api/types';
 import type { SessionBootstrapResult } from '@/agent/sessionFactory';
 import { SharedCodexRoot, type RootHost } from './root';
+import type { SharedCodexQueue } from './queue';
 import { codexPlanProposalId } from './plan';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 
@@ -28,6 +29,7 @@ vi.mock('../codexAppServerClient', () => ({
             if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
             if (method === 'thread/list') return { data: [] };
             if (method === 'thread/queue/list') return { data: this.queue };
+            if (method === 'thread/turns/list') return { data: structuredClone(this.thread.turns), nextCursor: null };
             if (method === 'thread/settings/update') {
                 this.settings = { ...this.settings, ...params };
                 this.notify?.('thread/settings/updated', { threadId: 'thread', threadSettings: this.settings });
@@ -70,6 +72,7 @@ async function fixture() {
         rpcHandlerManager: { registerHandler: (name: string, handler: (raw: unknown) => Promise<unknown>) => rpc.set(name, handler) },
         sendSessionEvent() {}, sendAgentMessage: send, emitSessionReady() {},
         sendUserMessage() {}, emitMessagesConsumed() {}, emitSteerIndeterminate() {}, syncNativeQueuedMessage() {},
+        setSteerDeliveryState: vi.fn(async () => true),
         sendSessionDeath() {}, async flush() {}, close() {}
     } as unknown as ApiSessionClient;
     const root = new SharedCodexRoot({ session, workingDirectory: directory } as SessionBootstrapResult, {
@@ -245,6 +248,47 @@ describe('shared plan actions', () => {
 });
 
 describe('shared steering availability', () => {
+    it('refreshes the authoritative active turn after a definite stale-turn rejection', async () => {
+        const f = await fixture();
+        await f.root.activate();
+        f.native.thread.turns = [{ id: 'turn-old', status: 'inProgress', items: [] }];
+        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'turn-old' } });
+        const queue = (f.root as unknown as { queue: SharedCodexQueue }).queue;
+        await queue.enqueue('wake-local', [{ type: 'text', text: 'wake' }]);
+
+        const request = f.root.client.request.bind(f.root.client);
+        const steers: Array<{ expectedTurnId: string; clientUserMessageId: string }> = [];
+        vi.spyOn(f.root.client, 'request').mockImplementation(async (method, params) => {
+            if (method === 'thread/queue/delete') {
+                f.native.queue = [];
+                return { deleted: true };
+            }
+            if (method === 'turn/steer') {
+                const value = params as { expectedTurnId: string; clientUserMessageId: string };
+                steers.push(value);
+                if (steers.length === 1) {
+                    // The server advanced, but its turn/started notification has
+                    // not reached the shared root when the first steer is rejected.
+                    f.native.thread.turns = [{ id: 'turn-current', status: 'inProgress', items: [] }];
+                    throw new Error('expected active turn id `turn-old` but found `turn-current`');
+                }
+                return {};
+            }
+            return await request(method, params);
+        });
+
+        const result = await f.rpc.get(RPC_METHODS.SteerQueuedMessage)!({ localId: 'wake-local' });
+
+        expect(result).toEqual({ steered: true });
+        expect(steers).toEqual([
+            { threadId: 'thread', expectedTurnId: 'turn-old', input: [{ type: 'text', text: 'wake' }], clientUserMessageId: 'wake-local' },
+            { threadId: 'thread', expectedTurnId: 'turn-current', input: [{ type: 'text', text: 'wake' }], clientUserMessageId: 'wake-local' }
+        ]);
+        expect(f.root.client.request).toHaveBeenCalledWith('thread/turns/list', expect.objectContaining({
+            threadId: 'thread', sortDirection: 'desc', limit: expect.any(Number), itemsView: 'notLoaded'
+        }), { timeoutMs: 5000 });
+    });
+
     it('keeps idle sessions online without polling usage or publishing agent-state updates', async () => {
         const f = await fixture();
         const requests = vi.spyOn(f.root.client, 'request');

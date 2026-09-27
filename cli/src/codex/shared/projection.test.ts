@@ -106,4 +106,27 @@ describe('shared history projection', () => {
         await projection.notification('item/completed', { threadId: 'child', turnId: 'turn', item: { id: 'prompt', type: 'userMessage', content: [{ type: 'text', text: 'child prompt' }], clientId: 'cid' } });
         expect(user).not.toHaveBeenCalled(); expect(committed).not.toHaveBeenCalled();
     });
+
+    it('does not commit a native user item when outbound delivery is rejected', async () => {
+        const send = vi.fn(); const user = vi.fn(() => false); const committed = vi.fn(async () => {});
+        const session = { getMetadata: () => ({}), sendAgentMessage: send, sendUserMessage: user, updateMetadata: vi.fn() } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', committed);
+
+        await expect(projection.notification('item/completed', {
+            threadId: 'thread',
+            turnId: 'turn',
+            item: { id: 'prompt', type: 'userMessage', content: [{ type: 'text', text: 'prompt' }], clientId: 'local' }
+        })).rejects.toThrow('Failed to deliver Codex user message local');
+
+        expect(user).toHaveBeenCalledWith('prompt', undefined, 'local');
+        expect(committed).not.toHaveBeenCalled();
+
+        user.mockReturnValueOnce(true);
+        await projection.notification('item/completed', {
+            threadId: 'thread',
+            turnId: 'turn',
+            item: { id: 'prompt', type: 'userMessage', content: [{ type: 'text', text: 'prompt' }], clientId: 'local' }
+        });
+        expect(committed).toHaveBeenCalledWith('local');
+    });
 });

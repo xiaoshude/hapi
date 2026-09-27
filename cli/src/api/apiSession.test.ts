@@ -7,6 +7,7 @@ const socketHarness = vi.hoisted(() => ({
         connectCalls: number
         connectImmediately: boolean
         emitted: Array<{ event: string; args: unknown[] }>
+        sendBuffer: Array<{ data?: unknown[] }>
         listeners: Map<string, Array<(...args: any[]) => void>>
         trigger: (event: string, ...args: any[]) => void
         triggerConnect: () => void
@@ -25,6 +26,7 @@ vi.mock('socket.io-client', () => ({
             connectCalls: 0,
             connectImmediately: true,
             emitted: [] as Array<{ event: string; args: unknown[] }>,
+            sendBuffer: [] as Array<{ data?: unknown[] }>,
             listeners: new Map<string, Array<(...args: any[]) => void>>(),
             trigger: () => {},
             triggerConnect: () => {},
@@ -74,7 +76,8 @@ vi.mock('socket.io-client', () => ({
             disconnect: () => {
                 state.connected = false
                 return socket
-            }
+            },
+            sendBuffer: state.sendBuffer
         }
         Object.assign(socket, { volatile: socket })
         socketHarness.sockets.push(state)
@@ -408,6 +411,122 @@ describe('ApiSessionClient lazy materialization', () => {
         await expect(client.flush({ timeoutMs: 20 })).resolves.toBe(false)
 
         expect(socket.connectCalls).toBeGreaterThan(0)
+        client.close()
+    })
+
+    it('does not emit droppable events into a disconnected socket buffer', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = false
+
+        for (let index = 0; index < 300; index += 1) {
+            client.sendSessionEvent({ type: 'ready' })
+        }
+
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(0)
+
+        socket.triggerConnect()
+
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(256)
+        client.close()
+    })
+
+    it('reports bounded lossless delivery failure instead of silently dropping user commands', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = false
+        const failures: unknown[] = []
+        client.on('outbound-delivery-failed', (failure) => failures.push(failure))
+
+        let overflow: unknown
+        for (let index = 0; index < 1_025; index += 1) {
+            try {
+                client.sendAgentMessage({ message: `agent-${index}` })
+            } catch (error) {
+                overflow = error
+                break
+            }
+        }
+
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(0)
+        expect(overflow).toBeInstanceOf(Error)
+        expect(failures).toHaveLength(1)
+
+        socket.triggerConnect()
+
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(1_024)
+        client.close()
+    })
+
+    it('rejects a local-id user message while disconnected before it can be committed', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = false
+        const failures: unknown[] = []
+        client.on('outbound-delivery-failed', (failure) => failures.push(failure))
+
+        expect(() => client.sendUserMessage('native prompt', undefined, 'local-1'))
+            .toThrow('HAPI lossless outbound delivery failed')
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(0)
+        expect(socket.emitted.filter((entry) => entry.event === 'messages-consumed')).toHaveLength(0)
+        expect(failures).toHaveLength(1)
+        client.close()
+    })
+
+    it('rejects a local-id user message before lazy materialization can hold it only in RAM', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession(), {
+            materialize: async () => createSession({ namespace: 'default' })
+        })
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+
+        expect(() => client.sendUserMessage('native prompt', undefined, 'local-pending'))
+            .toThrow('HAPI lossless outbound delivery failed')
+        expect(client.getState()).toBe('pending')
+        client.close()
+    })
+
+    it('moves lossless socket packets to bounded recovery and drops buffered terminal output', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = false
+        socket.sendBuffer.push(
+            { data: ['agent-terminal:output', { data: 'spinner' }] },
+            { data: ['message', { sid: 'session', message: { role: 'agent' } }] }
+        )
+
+        socket.trigger('disconnect', 'transport close')
+        expect(socket.sendBuffer).toHaveLength(0)
+
+        socket.triggerConnect()
+
+        expect(socket.emitted.filter((entry) => entry.event === 'agent-terminal:output')).toHaveLength(0)
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(1)
+        client.close()
+    })
+
+    it('fails closed on the lossless byte budget before the packet-count cap', () => {
+        socketHarness.sockets.length = 0
+        const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
+        const socket = socketHarness.sockets[0]
+        if (!socket) throw new Error('expected socket')
+        socket.connected = false
+        const failures: unknown[] = []
+        client.on('outbound-delivery-failed', (failure) => failures.push(failure))
+
+        expect(() => client.sendAgentMessage({ message: 'x'.repeat(17 * 1024 * 1024) }))
+            .toThrow('HAPI lossless outbound delivery failed')
+        expect(failures).toHaveLength(1)
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(0)
         client.close()
     })
 })

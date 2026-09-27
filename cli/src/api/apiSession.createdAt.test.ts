@@ -43,6 +43,7 @@ describe('sendClaudeSessionMessage createdAt propagation', () => {
 
     function makeClient() {
         const fakeSocket = {
+            connected: true,
             on: vi.fn(),
             connect: vi.fn(),
             emit: vi.fn(),

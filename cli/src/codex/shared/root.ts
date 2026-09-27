@@ -62,6 +62,7 @@ export class SharedCodexRoot {
     private settingsRevision = 0;
     private refreshing?: Promise<void>;
     private pendingRefreshSnapshot?: Record<string, unknown>;
+    private pendingRefreshReplay = false;
     private interrupted = false;
     private closed = false;
     private stopping = false;
@@ -149,10 +150,9 @@ export class SharedCodexRoot {
             if (!this.threadId || this.closed || this.stopping) return;
             // An emitted socket packet is not a durable hub acknowledgement.
             // Replay final native history with stable IDs after every reconnect.
-            this.projection?.reset();
             this.steeringActive = undefined;
             this.publishedPlanId = undefined;
-            void this.refresh().then(() => this.refreshChildren(false)).then(() => this.queue.replay())
+            void this.refresh(undefined, true).then(() => this.refreshChildren(false)).then(() => this.queue.replay())
                 .catch(error => logger.debug('[Codex shared] hub resync', error));
         });
     }
@@ -317,17 +317,26 @@ export class SharedCodexRoot {
         } else thread = record(record(await this.client.request('thread/read', { threadId, includeTurns: true })).thread);
         return thread;
     }
-    refresh(snapshot?: Record<string, unknown>): Promise<void> {
+    refresh(snapshot?: Record<string, unknown>, replay = false): Promise<void> {
         const complete = snapshot ? this.completeThreadSnapshot(snapshot) : undefined;
         if (complete) this.pendingRefreshSnapshot = complete;
+        if (replay) this.pendingRefreshReplay = true;
         return this.refreshing ??= this.refreshLoop().finally(() => { this.refreshing = undefined; });
     }
     private async refreshLoop(): Promise<void> {
         do {
             const snapshot = this.pendingRefreshSnapshot;
             this.pendingRefreshSnapshot = undefined;
-            await this.refreshNow(snapshot);
-        } while (this.pendingRefreshSnapshot);
+            const replay = this.pendingRefreshReplay;
+            this.pendingRefreshReplay = false;
+            if (replay) this.projection.reset();
+            try {
+                await this.refreshNow(snapshot);
+            } catch (error) {
+                if (!this.pendingRefreshSnapshot && !this.pendingRefreshReplay) throw error;
+                logger.debug('[Codex shared] superseded refresh failed; continuing with newer replay', error);
+            }
+        } while (this.pendingRefreshSnapshot || this.pendingRefreshReplay);
     }
     private async refreshNow(snapshot?: Record<string, unknown>): Promise<void> {
         if (!this.threadId || this.closed || !this.client.isInitialized()) return;
@@ -403,8 +412,7 @@ export class SharedCodexRoot {
                     const observedSettings = this.settingsRevision !== settingsRevision;
                     this.acceptSettings(response);
                     if (!observedSettings) this.acceptSettings(this.host.settingsFor(this.threadId) ?? {});
-                    this.projection.reset();
-                    await this.refresh(this.completeThreadSnapshot(response.thread));
+                    await this.refresh(this.completeThreadSnapshot(response.thread), true);
                     this.queue.replay(); await this.refreshChildren(true);
                     return;
                 } catch (error) {

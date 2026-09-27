@@ -47,6 +47,7 @@ export class SharedCodexProjection {
     private readonly pendingTitles = new Map<string, string>();
     private readonly completedTitles = new Set<string>();
     private titleRevision = 0;
+    private generation = 0;
     constructor(private readonly session: ApiSessionClient, readonly threadId: string,
         private readonly committed: (id: string) => Promise<void>, private readonly parentThreadId?: string) {
         if (!parentThreadId) for (const [id, turn] of Object.entries(session.getMetadata()?.conversationHistoryTurns ?? {})) {
@@ -57,6 +58,7 @@ export class SharedCodexProjection {
 
     turnFor(id: string): string | undefined { return this.turns.get(id); }
     reset(): void {
+        this.generation++;
         this.converter = new AppServerEventConverter();
         this.emitted.clear();
         this.projectedUsers.clear();
@@ -72,6 +74,7 @@ export class SharedCodexProjection {
     }
 
     async notification(method: string, params: unknown, modelAtReceipt?: string): Promise<void> {
+        const generation = this.generation;
         const p = record(params);
         const item = record(p.item);
         if (!this.parentThreadId && p.threadId === this.threadId && string(item.id)) {
@@ -92,11 +95,13 @@ export class SharedCodexProjection {
                 }
             }
         }
-        await this.project(method, params, modelAtReceipt);
+        if (generation !== this.generation) return;
+        await this.project(method, params, modelAtReceipt, undefined, generation);
     }
 
     private async project(method: string, params: unknown, modelAtReceipt?: string,
-        historyMetadata?: HistoryMetadataBatch): Promise<void> {
+        historyMetadata?: HistoryMetadataBatch, expectedGeneration = this.generation): Promise<void> {
+        if (expectedGeneration !== this.generation) return;
         if (method.startsWith('codex/event/')) return;
         const p = record(params);
         const item = record(p.item);
@@ -129,6 +134,7 @@ export class SharedCodexProjection {
                     // transport. A bounded disconnected-transport failure must
                     // leave the native localId replayable on the next recovery.
                     await this.committed(id);
+                    if (expectedGeneration !== this.generation) return;
                     this.projectedUsers.add(id);
                     if (turnId) {
                         this.turns.set(id, turnId);
@@ -151,6 +157,7 @@ export class SharedCodexProjection {
         }
         const events = this.converter.handleNotification(method, params);
         for (const event of events) {
+            if (expectedGeneration !== this.generation) return;
             const callId = string(event.call_id);
             const key = `${turnId ?? 'thread'}:${itemId ?? callId ?? createHash('sha256').update(JSON.stringify(event)).digest('hex')}:${event.type}`;
             if (event.type === 'agent_message') this.send({ type: 'message', message: event.message }, key);
@@ -207,19 +214,21 @@ export class SharedCodexProjection {
         const turns = record(thread).turns;
         if (!Array.isArray(turns)) return;
         const titleRevision = this.titleRevision;
+        const generation = this.generation;
         const historyMetadata: HistoryMetadataBatch = { dirty: false, points: new Set() };
         let latestTitle: string | undefined;
         for (const value of turns) {
             const turn = record(value);
             if (!Array.isArray(turn.items)) continue;
             for (const item of turn.items) {
+                if (generation !== this.generation) return;
                 const params = { threadId: this.threadId, turnId: turn.id, item };
                 const titleKey = `${string(turn.id) ?? 'thread'}:${record(item).id}`;
                 const pendingTitle = requestedTitle(record(item));
                 if (!this.parentThreadId && string(record(item).id) && pendingTitle && !this.completedTitles.has(titleKey)) {
                     this.pendingTitles.set(titleKey, pendingTitle);
                 }
-                await this.project('item/started', params, undefined, historyMetadata);
+                await this.project('item/started', params, undefined, historyMetadata, generation);
                 // Active snapshots can contain partial assistant text. Do not
                 // settle it under the final stable id and suppress completion.
                 if (turn.status !== 'inProgress' || record(item).status === 'completed' || record(item).type === 'userMessage') {
@@ -231,10 +240,11 @@ export class SharedCodexProjection {
                         }
                         this.pendingTitles.delete(titleKey);
                     }
-                    await this.project('item/completed', params, undefined, historyMetadata);
+                    await this.project('item/completed', params, undefined, historyMetadata, generation);
                 }
             }
         }
+        if (generation !== this.generation) return;
         if (!this.parentThreadId && historyMetadata.dirty) {
             const points = Object.fromEntries([...historyMetadata.points].map(id => [id, true as const]));
             this.session.updateMetadata(metadata => ({

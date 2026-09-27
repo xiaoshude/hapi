@@ -359,6 +359,88 @@ describe('shared steering availability', () => {
         expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'new reply' }), expect.any(String));
     });
 
+    it('fences an old replay generation when reconnect resets during history projection', async () => {
+        const f = await fixture();
+        const projection = (f.root as unknown as {
+            projection: { history(thread: unknown): Promise<void> }
+        }).projection;
+        const originalHistory = projection.history.bind(projection);
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const enteredHistory = new Promise<void>(resolve => { entered = resolve; });
+        vi.spyOn(projection, 'history').mockImplementation(async thread => {
+            entered();
+            await blocked;
+            return originalHistory(thread);
+        });
+        const oldSnapshot = {
+            turns: [{
+                id: 'old-turn', status: 'completed', items: [
+                    { id: 'old-user-item', type: 'userMessage', clientId: 'shared-local', content: [{ type: 'text', text: 'old prompt' }] },
+                    { id: 'old-agent-item', type: 'agentMessage', text: 'old reply' }
+                ]
+            }]
+        };
+        const newTurns = [{
+            id: 'new-turn', status: 'completed', items: [
+                { id: 'new-user-item', type: 'userMessage', clientId: 'shared-local', content: [{ type: 'text', text: 'new prompt' }] },
+                { id: 'new-agent-item', type: 'agentMessage', text: 'new reply' }
+            ]
+        }];
+        const oldRefresh = f.root.refresh(oldSnapshot);
+        await enteredHistory;
+        const user = vi.spyOn(f.root.session, 'sendUserMessage');
+        f.native.thread.turns = newTurns;
+        f.reconnect();
+        release();
+        await oldRefresh;
+        await vi.waitFor(() => expect(f.send).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'message', message: 'new reply' }), expect.any(String)
+        ));
+
+        expect(user).toHaveBeenCalledTimes(2);
+        const messages = f.send.mock.calls
+            .map(([body]) => body)
+            .filter(body => body.type === 'message')
+            .map(body => body.message);
+        expect(messages).toEqual(['old reply', 'new reply']);
+    });
+
+    it('continues with a pending reconnect replay when the old refresh fails', async () => {
+        const f = await fixture();
+        const projection = (f.root as unknown as {
+            projection: { history(thread: unknown): Promise<void> }
+        }).projection;
+        const originalHistory = projection.history.bind(projection);
+        let release!: () => void;
+        let entered!: () => void;
+        let calls = 0;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const enteredHistory = new Promise<void>(resolve => { entered = resolve; });
+        vi.spyOn(projection, 'history').mockImplementation(async thread => {
+            if (calls++ === 0) {
+                entered();
+                await blocked;
+                throw new Error('old replay failed');
+            }
+            return originalHistory(thread);
+        });
+        const oldRefresh = f.root.refresh({
+            turns: [{ id: 'old-turn', status: 'completed', items: [{ id: 'old-item', type: 'agentMessage', text: 'old reply' }] }]
+        });
+        await enteredHistory;
+        f.native.thread.turns = [{
+            id: 'new-turn', status: 'completed', items: [{ id: 'new-item', type: 'agentMessage', text: 'new reply' }]
+        }];
+        f.reconnect();
+        release();
+        await oldRefresh;
+
+        expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'new reply' }), expect.any(String));
+        expect(f.send).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'old reply' }), expect.any(String));
+    });
+
     it('falls back to paginated native history when a snapshot is not complete', async () => {
         const f = await fixture();
         f.native.thread.historyMode = 'paginated';

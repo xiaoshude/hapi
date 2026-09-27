@@ -70,6 +70,34 @@ describe('shared history projection', () => {
         expect(committed).toHaveBeenCalledTimes(2);
     });
 
+    it('drops an in-flight old-generation user projection after reset', async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const enteredCommit = new Promise<void>(resolve => { entered = resolve; });
+        const user = vi.fn(() => true);
+        const committed = vi.fn(async () => {
+            entered();
+            await blocked;
+        });
+        const session = {
+            getMetadata: () => ({}),
+            updateMetadata: vi.fn(),
+            sendAgentMessage: vi.fn(),
+            sendUserMessage: user
+        } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', committed);
+        const item = { id: 'user-item', type: 'userMessage', clientId: 'local', content: [{ type: 'text', text: 'prompt' }] };
+        const notification = projection.notification('item/completed', { threadId: 'thread', turnId: 'turn', item });
+        await enteredCommit;
+        projection.reset();
+        release();
+        await notification;
+
+        await projection.history({ turns: [{ id: 'turn', status: 'completed', items: [item] }] });
+        expect(user).toHaveBeenCalledTimes(2);
+    });
+
     it('projects a 38k-item history with one metadata snapshot and one user delivery per local id', async () => {
         let metadata: Record<string, unknown> = {};
         const updateMetadata = vi.fn((handler: (value: Record<string, unknown>) => Record<string, unknown>) => {

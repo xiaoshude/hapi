@@ -542,7 +542,7 @@ describe('ApiSessionClient lazy materialization', () => {
         client.close()
     })
 
-    it('settles an abandoned ACK as a disconnect failure without replaying its mutation', async () => {
+    it('settles an ACK when non-ACK recovery overflows without replaying its mutation', async () => {
         socketHarness.sockets.length = 0
         const client = new ApiSessionClient('token', createSession({ namespace: 'default' }))
         const socket = socketHarness.sockets[0]
@@ -552,7 +552,12 @@ describe('ApiSessionClient lazy materialization', () => {
 
         const result = client.setSteerDeliveryState(['local-1'], 'dispatching')
         await vi.waitFor(() => expect(socket.pendingAckReject).not.toBeNull())
-        socket.sendBuffer.push({ id: 7, data: ['messages-steer-state', { sid: 'session', state: 'dispatching' }] })
+        socket.sendBuffer.push(
+            { id: 7, data: ['messages-steer-state', { sid: 'session', state: 'dispatching' }] },
+            ...Array.from({ length: 1_025 }, (_, index) => ({
+                data: ['message', { sid: 'session', message: { role: 'agent', index } }]
+            }))
+        )
         socket.connected = false
         socket.trigger('disconnect', 'transport close')
 
@@ -560,6 +565,7 @@ describe('ApiSessionClient lazy materialization', () => {
         expect(socket.ackRejected).toBe(true)
         socket.triggerConnect()
         expect(socket.emitted.filter((entry) => entry.event === 'messages-steer-state')).toHaveLength(0)
+        expect(socket.emitted.filter((entry) => entry.event === 'message')).toHaveLength(1_024)
         client.close()
     })
 

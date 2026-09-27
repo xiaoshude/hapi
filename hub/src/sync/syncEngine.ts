@@ -537,8 +537,16 @@ export class SyncEngine {
         collaborationMode?: CodexCollaborationMode
     }): void {
         this.sessionCache.handleSessionAlive(payload)
-        this.messageService.replayImmediateQueuedMessages(payload.sid)
-        this.triggerDedupIfNeeded(payload.sid)
+    }
+
+    /**
+     * Recovery work belongs to the inactive-to-active attach edge. Keeping it
+     * out of the periodic heartbeat path prevents every 2s keepalive from
+     * replaying the same durable queued prompts and rerunning dedup scans.
+     */
+    handleSessionAttached(sessionId: string): void {
+        this.messageService.replayImmediateQueuedMessages(sessionId)
+        this.triggerDedupIfNeeded(sessionId)
     }
 
     handleSessionReady(payload: { sid: string; time: number }): void {

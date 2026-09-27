@@ -88,6 +88,7 @@ export type SessionHandlersDeps = {
     resolveSessionAccess: ResolveSessionAccess
     emitAccessError: EmitAccessError
     onSessionAlive?: (payload: SessionAlivePayload) => void
+    onSessionAttached?: (payload: SessionAlivePayload) => void
     onSessionReady?: (payload: SessionReadyPayload) => void
     onSessionEnd?: (payload: SessionEndPayload) => void
     onWebappEvent?: (event: SyncEvent) => void
@@ -101,7 +102,8 @@ export type SessionHandlersDeps = {
 }
 
 export function registerSessionHandlers(socket: CliSocketWithData, deps: SessionHandlersDeps): void {
-    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const { store, resolveSessionAccess, emitAccessError, onSessionAlive, onSessionAttached, onSessionReady, onSessionEnd, onWebappEvent, onBackgroundTaskDelta, onSessionActivity, onSweepImmediateQueued, onMessagesConsumed } = deps
+    const attachedSessionIds = new Set<string>()
 
     socket.on('native-queue-message', data => {
         const parsed = z.object({ sid: z.string(), localId: z.string().min(1), text: z.string().nullable() }).safeParse(data)
@@ -382,6 +384,10 @@ export function registerSessionHandlers(socket: CliSocketWithData, deps: Session
             return
         }
         onSessionAlive?.(data)
+        if (!attachedSessionIds.has(data.sid)) {
+            attachedSessionIds.add(data.sid)
+            onSessionAttached?.(data)
+        }
     })
 
     socket.on('session-ready', (data: SessionReadyPayload) => {

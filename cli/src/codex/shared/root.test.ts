@@ -4,6 +4,7 @@ import type { ApiSessionClient } from '@/api/apiSession';
 import type { AgentState, Metadata } from '@/api/types';
 import type { SessionBootstrapResult } from '@/agent/sessionFactory';
 import { SharedCodexRoot, type RootHost } from './root';
+import type { SharedCodexQueue } from './queue';
 import { codexPlanProposalId } from './plan';
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods';
 
@@ -35,7 +36,7 @@ vi.mock('../codexAppServerClient', () => ({
                 this.resumeReads++;
                 return { ...this.settings, thread: structuredClone(this.thread) };
             }
-            if (method === 'thread/turns/list') return { data: structuredClone(this.thread.turns) };
+            if (method === 'thread/turns/list') return { data: structuredClone(this.thread.turns), nextCursor: null };
             if (method === 'thread/list') return { data: [] };
             if (method === 'thread/queue/list') return { data: this.queue };
             if (method === 'thread/settings/update') {
@@ -455,6 +456,46 @@ describe('shared steering availability', () => {
         expect(f.native.historyReads).toBe(1);
         expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'native reply' }), expect.any(String));
         expect(f.send).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'partial reply' }), expect.any(String));
+    });
+
+    it('refreshes the authoritative active turn after a definite stale-turn rejection', async () => {
+        const f = await fixture();
+        await f.root.activate();
+        f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'turn-old' } });
+        const queue = (f.root as unknown as { queue: SharedCodexQueue }).queue;
+        await queue.enqueue('wake-local', [{ type: 'text', text: 'wake' }]);
+
+        const request = f.root.client.request.bind(f.root.client);
+        const steers: Array<{ expectedTurnId: string; clientUserMessageId: string }> = [];
+        vi.spyOn(f.root.client, 'request').mockImplementation(async (method, params) => {
+            if (method === 'thread/queue/delete') {
+                f.native.queue = [];
+                return { deleted: true };
+            }
+            if (method === 'turn/steer') {
+                const value = params as { expectedTurnId: string; clientUserMessageId: string };
+                steers.push(value);
+                if (steers.length === 1) {
+                    // The server advanced, but its turn/started notification has
+                    // not reached the shared root when the first steer is rejected.
+                    f.native.thread.turns = [{ id: 'turn-current', status: 'inProgress', items: [] }];
+                    throw new Error('expected active turn id `turn-old` but found `turn-current`');
+                }
+                return {};
+            }
+            return await request(method, params);
+        });
+
+        const result = await f.rpc.get(RPC_METHODS.SteerQueuedMessage)!({ localId: 'wake-local' });
+
+        expect(result).toEqual({ steered: true });
+        expect(steers).toEqual([
+            { expectedTurnId: 'turn-old', clientUserMessageId: 'wake-local' },
+            { expectedTurnId: 'turn-current', clientUserMessageId: 'wake-local' }
+        ]);
+        expect(f.root.client.request).toHaveBeenCalledWith('thread/turns/list', expect.objectContaining({
+            threadId: 'thread', sortDirection: 'desc', limit: expect.any(Number)
+        }));
     });
 
     it('keeps idle sessions online without polling usage or publishing agent-state updates', async () => {

@@ -39,12 +39,12 @@ describe('process retirement through a real Hub', () => {
                 const [code] = await exit
                 expect(code).toBe(0)
                 const load = async () => {
-                  const response = await fetch(`${process.env.HAPI_API_URL}/cli/sessions/${id}`, {
-                    headers: { Authorization: `Bearer ${process.env.CLI_API_TOKEN}` }
-                  })
-                  return z.object({ session: z.object({ active: z.boolean(), metadata: z.object({
-                    codexSessionId: z.string().optional(), lifecycleState: z.string(), archiveReason: z.string().optional()
-                  }) }) }).parse(await response.json()).session
+                    const response = await fetch(`${process.env.HAPI_API_URL}/cli/sessions/${id}`, {
+                        headers: { Authorization: `Bearer ${process.env.CLI_API_TOKEN}` }
+                    })
+                    return z.object({ session: z.object({ active: z.boolean(), metadata: z.object({
+                        codexSessionId: z.string().optional(), lifecycleState: z.string(), archiveReason: z.string().optional()
+                    }) }) }).parse(await response.json()).session
                 }
                 let session = await load()
                 const deadline = Date.now() + 36_000

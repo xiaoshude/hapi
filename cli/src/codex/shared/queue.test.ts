@@ -150,7 +150,7 @@ describe('shared native queue', () => {
         let steerAttempts = 0;
         rpc.mockResolvedValueOnce({ data: [queued], nextCursor: null })
             .mockResolvedValueOnce({ deleted: true })
-            .mockImplementation(async (method, params: any) => {
+            .mockImplementation(async method => {
                 if (method !== 'turn/steer') throw new Error(`unexpected ${method}`);
                 steerAttempts += 1;
                 if (steerAttempts === 1) {

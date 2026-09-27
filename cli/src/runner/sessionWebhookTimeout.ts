@@ -16,11 +16,7 @@ export function resolveSessionWebhookTimeoutMs(
         ?? DEFAULT_WEBHOOK_TIMEOUT_MS;
     if (options.agent !== 'codex' || !options.resumeSessionId) return globalTimeoutMs;
 
-    // This value can extend the shared safety budget. It cannot shorten it
-    // below the Codex history RPC deadline plus startup/cleanup headroom.
-    const codexResumeTimeoutMs = Math.max(
-        CODEX_RESUME_WEBHOOK_TIMEOUT_MS,
-        parsePositiveTimeout(env.HAPI_RUNNER_CODEX_RESUME_WEBHOOK_TIMEOUT_MS) ?? 0
-    );
-    return Math.max(globalTimeoutMs, codexResumeTimeoutMs);
+    // This shared budget is derived to remain below Hub's resume RPC deadline.
+    // Generic Runner overrides apply to ordinary spawns, not Codex resumes.
+    return CODEX_RESUME_WEBHOOK_TIMEOUT_MS;
 }

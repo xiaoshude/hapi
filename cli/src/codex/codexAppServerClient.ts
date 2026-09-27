@@ -85,12 +85,10 @@ export function isIndeterminateError(error: unknown): boolean {
 }
 
 const HISTORY_REQUEST_METHODS = new Set([
-    'thread/start',
     'thread/read',
     'thread/resume',
     'thread/fork',
     'thread/turns/list',
-    'thread/compact/start',
 ]);
 
 type CodexAppServerClientOptions = {

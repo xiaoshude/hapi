@@ -33,6 +33,7 @@ import { scheduleCursorModelsPrewarm } from '@/modules/common/cursorModelsPrewar
 import { isLinkedGitWorktree } from '@/utils/isLinkedGitWorktree';
 import { agentUnavailableMessage, getAgentAvailability } from '@/agent/agentAvailability';
 import { copyCodexConfigFile, resolveCodexHome } from '@/codex/utils/codexHome';
+import { resolveSessionWebhookTimeoutMs } from './sessionWebhookTimeout';
 
 /**
  * Deduplicates a preallocated HAPI-row spawn only while its child is alive.
@@ -382,18 +383,6 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
     }
     persistResumeProcesses();
 
-    // Webhook timeout tolerance. Opus 1M + --resume can legitimately take
-    // longer than the default 15s to reach the "Session started" webhook
-    // (observed real-world durations of 30s – 60min under rate-limit /
-    // heavy session restore). Allow advanced users to raise this ceiling
-    // so that slow starts no longer leave orphaned child processes which
-    // later report back as ghost sessions.
-    const envWebhookTimeout = Number(process.env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS);
-    const webhookTimeoutMs =
-      Number.isFinite(envWebhookTimeout) && envWebhookTimeout > 0
-        ? envWebhookTimeout
-        : 15_000;
-
     // Session spawning awaiter system
     const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
     const pidToErrorAwaiter = new Map<number, (errorMessage: string) => void>();
@@ -522,6 +511,7 @@ export async function startRunner(options: { workspaceRoots?: string[] } = {}): 
 
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
       const agent = options.agent ?? 'claude';
+      const webhookTimeoutMs = resolveSessionWebhookTimeoutMs(options);
       const availability = getAgentAvailability(agent);
       if (!availability.available) {
         const errorMessage = agentUnavailableMessage(availability);

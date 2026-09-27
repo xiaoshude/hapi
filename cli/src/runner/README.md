@@ -119,7 +119,8 @@ Initiated by mobile app via backend RPC:
    - Configures agent-specific token environment
    - Spawns detached HAPI process with `--hapi-starting-mode remote --started-by runner`
    - Adds to `pidToTrackedSession` map
-   - Waits for the session-start webhook (15 seconds by default; `HAPI_RUNNER_WEBHOOK_TIMEOUT_MS` overrides)
+   - Waits for the session-start webhook (15 seconds by default; `HAPI_RUNNER_WEBHOOK_TIMEOUT_MS` overrides ordinary spawns)
+   - Codex resumes use a 63-minute startup webhook budget above the 61-minute app-server history deadline; `HAPI_RUNNER_CODEX_RESUME_WEBHOOK_TIMEOUT_MS` can extend it, but cannot undercut that budget
 4. New HAPI process:
    - Creates session with backend, receives `happySessionId`
    - Calls `notifyRunnerSessionStarted()` to POST to runner's `/session-started`
@@ -564,4 +565,5 @@ Authorization: Bearer <CLI_API_TOKEN>
 
 - Normal shutdown removes `runner.state.json`; its absence does not prove the runner has never run. Use logs for shutdown history.
 - Resume-spawn tracking persists separately in `runner.state.json.resume-processes.json`, with process-generation checks before recovery or termination. It is not a complete inventory of every terminal-started process.
+- Resuming a Codex thread gets a 63-minute startup webhook budget because loading persisted history may take up to an hour. `HAPI_RUNNER_CODEX_RESUME_WEBHOOK_TIMEOUT_MS` can extend it; the Hub waits up to 65 minutes for this RPC.
 - The local control server binds to `127.0.0.1` on a random port. It has no remote authentication layer; do not expose it through a public proxy.

@@ -72,6 +72,7 @@ async function fixture() {
         rpcHandlerManager: { registerHandler: (name: string, handler: (raw: unknown) => Promise<unknown>) => rpc.set(name, handler) },
         sendSessionEvent() {}, sendAgentMessage: send, emitSessionReady() {},
         sendUserMessage() {}, emitMessagesConsumed() {}, emitSteerIndeterminate() {}, syncNativeQueuedMessage() {},
+        setSteerDeliveryState: vi.fn(async () => true),
         sendSessionDeath() {}, async flush() {}, close() {}
     } as unknown as ApiSessionClient;
     const root = new SharedCodexRoot({ session, workingDirectory: directory } as SessionBootstrapResult, {
@@ -250,6 +251,7 @@ describe('shared steering availability', () => {
     it('refreshes the authoritative active turn after a definite stale-turn rejection', async () => {
         const f = await fixture();
         await f.root.activate();
+        f.native.thread.turns = [{ id: 'turn-old', status: 'inProgress', items: [] }];
         f.native.notify('turn/started', { threadId: 'thread', turn: { id: 'turn-old' } });
         const queue = (f.root as unknown as { queue: SharedCodexQueue }).queue;
         await queue.enqueue('wake-local', [{ type: 'text', text: 'wake' }]);
@@ -279,12 +281,12 @@ describe('shared steering availability', () => {
 
         expect(result).toEqual({ steered: true });
         expect(steers).toEqual([
-            { expectedTurnId: 'turn-old', clientUserMessageId: 'wake-local' },
-            { expectedTurnId: 'turn-current', clientUserMessageId: 'wake-local' }
+            { threadId: 'thread', expectedTurnId: 'turn-old', input: [{ type: 'text', text: 'wake' }], clientUserMessageId: 'wake-local' },
+            { threadId: 'thread', expectedTurnId: 'turn-current', input: [{ type: 'text', text: 'wake' }], clientUserMessageId: 'wake-local' }
         ]);
         expect(f.root.client.request).toHaveBeenCalledWith('thread/turns/list', expect.objectContaining({
-            threadId: 'thread', sortDirection: 'desc', limit: expect.any(Number)
-        }));
+            threadId: 'thread', sortDirection: 'desc', limit: expect.any(Number), itemsView: 'notLoaded'
+        }), { timeoutMs: 5000 });
     });
 
     it('keeps idle sessions online without polling usage or publishing agent-state updates', async () => {

@@ -1,5 +1,6 @@
 import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionMode } from '@hapi/protocol/types'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import { CODEX_RESUME_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
 import {
     ArchiveCodexSessionRpcResponseSchema,
     AgentAvailabilityResponseSchema,
@@ -223,7 +224,10 @@ export class RpcGateway {
                     copilotAgentMode,
                     startingMode,
                     forkSession: forkSession === true
-                }
+                },
+                agent === 'codex' && Boolean(resumeSessionId)
+                    ? CODEX_RESUME_RPC_TIMEOUT_MS
+                    : DEFAULT_RPC_TIMEOUT_MS
             )
             if (result && typeof result === 'object') {
                 const obj = result as Record<string, unknown>

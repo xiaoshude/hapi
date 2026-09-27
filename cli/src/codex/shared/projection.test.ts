@@ -3,6 +3,9 @@ import type { ApiSessionClient } from '@/api/apiSession';
 import { SharedCodexProjection, inputText } from './projection';
 import { codexPlanProposalId } from './plan';
 
+const registerGeneratedImageFromPath = vi.hoisted(() => vi.fn());
+vi.mock('@/modules/common/generatedImages', () => ({ registerGeneratedImageFromPath }));
+
 describe('shared history projection', () => {
     it.each([undefined, 'root'])('persists proposals without approval and replays the same IDs (parent: %s)', async parentThreadId => {
         const send = vi.fn();
@@ -96,6 +99,39 @@ describe('shared history projection', () => {
 
         await projection.history({ turns: [{ id: 'turn', status: 'completed', items: [item] }] });
         expect(user).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not emit a generated image after registration crosses a reset', async () => {
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const enteredRegistration = new Promise<void>(resolve => { entered = resolve; });
+        registerGeneratedImageFromPath.mockImplementation(async () => {
+            entered();
+            await blocked;
+            return { id: 'image', fileName: 'generated.png', mimeType: 'image/png' };
+        });
+        const send = vi.fn();
+        const session = { getMetadata: () => ({}), sendAgentMessage: send } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', async () => {});
+        const notification = projection.notification('item/completed', {
+            threadId: 'thread',
+            turnId: 'turn',
+            item: {
+                id: 'image-item',
+                type: 'imageGeneration',
+                savedPath: '/tmp/generated.png',
+                fileName: 'generated.png',
+                status: 'completed'
+            }
+        });
+        await enteredRegistration;
+        projection.reset();
+        release();
+        await notification;
+
+        expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'generated-image' }), expect.any(String));
+        registerGeneratedImageFromPath.mockReset();
     });
 
     it('projects a 38k-item history with one metadata snapshot and one user delivery per local id', async () => {

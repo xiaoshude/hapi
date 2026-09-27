@@ -193,6 +193,7 @@ export class SharedCodexProjection {
                 this.send({ type: 'tool-call-result', callId: 'codex-plan-state', output: { plan: event.plan, source: 'codex', status: 'updated' } }, `${key}:result`);
             } else if (event.type === 'generated_image' && typeof event.saved_path === 'string') {
                 const image = await registerGeneratedImageFromPath({ path: event.saved_path, id: createHash('sha256').update(`${this.threadId}:${key}`).digest('hex'), fileName: string(event.file_name) });
+                if (expectedGeneration !== this.generation) return;
                 if (image) this.send({ type: 'generated-image', imageId: image.id, fileName: image.fileName, mimeType: image.mimeType }, key);
             } else if (event.type === 'task_failed') {
                 this.send({ type: 'message', message: `Codex error: ${event.error ?? event.message ?? 'Turn failed'}` }, key);

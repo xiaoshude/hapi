@@ -358,6 +358,39 @@ describe('CodexAppServerClient history request timeouts', () => {
         }
     });
 
+    it.each(['readThread', 'resumeThread', 'forkThread'] as const)(
+        'bounds the %s convenience method at the dedicated history timeout',
+        async method => {
+            const { client } = await connectedClientWithWritableStdin();
+            vi.useFakeTimers();
+
+            try {
+                let settled = false;
+                let error: unknown;
+                const pending = method === 'readThread'
+                    ? client.readThread({ threadId: 'stalled-thread' })
+                    : method === 'forkThread'
+                        ? client.forkThread({ threadId: 'stalled-thread' })
+                        : client.resumeThread({ threadId: 'stalled-thread' });
+                void pending.then(
+                    () => { settled = true; },
+                    reason => { error = reason; settled = true; }
+                );
+
+                await vi.advanceTimersByTimeAsync(CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS);
+
+                expect(settled).toBe(true);
+                expect(error).toBeInstanceOf(Error);
+                expect((error as Error).message).toContain(
+                    `timed out after ${CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
+                );
+            } finally {
+                vi.useRealTimers();
+                await client.disconnect();
+            }
+        }
+    );
+
     it.each(['thread/start', 'thread/compact/start', 'turn/start'])(
         'keeps %s on the interactive deadline', async method => {
             const { child, client } = await connectedClientWithWritableStdin();

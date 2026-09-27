@@ -42,6 +42,115 @@ describe('shared history projection', () => {
         expect(send.mock.calls[1][0]).toMatchObject({ output: null });
     });
 
+    it('does not treat persisted fork locators as delivery acknowledgements after reconnect', async () => {
+        let metadata: Record<string, unknown> = { conversationHistoryTurns: { local: 'turn' } };
+        const user = vi.fn(() => true);
+        const committed = vi.fn(async () => {});
+        const session = {
+            getMetadata: () => metadata,
+            updateMetadata: vi.fn((handler: (value: Record<string, unknown>) => Record<string, unknown>) => {
+                metadata = handler(metadata);
+            }),
+            sendAgentMessage: vi.fn(),
+            sendUserMessage: user
+        } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', committed);
+        const snapshot = {
+            turns: [{
+                id: 'turn', status: 'completed',
+                items: [{ id: 'item', type: 'userMessage', clientId: 'local', content: [{ type: 'text', text: 'prompt' }] }]
+            }]
+        };
+
+        await projection.history(snapshot);
+        projection.reset();
+        await projection.history(snapshot);
+
+        expect(user).toHaveBeenCalledTimes(2);
+        expect(committed).toHaveBeenCalledTimes(2);
+    });
+
+    it('projects a 38k-item history with one metadata snapshot and one user delivery per local id', async () => {
+        let metadata: Record<string, unknown> = {};
+        const updateMetadata = vi.fn((handler: (value: Record<string, unknown>) => Record<string, unknown>) => {
+            metadata = handler(metadata);
+        });
+        const send = vi.fn();
+        const user = vi.fn(() => true);
+        const committed = vi.fn(async () => {});
+        const session = {
+            getMetadata: () => metadata,
+            updateMetadata,
+            sendAgentMessage: send,
+            sendUserMessage: user
+        } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', committed);
+        const turns: unknown[] = Array.from({ length: 38_000 }, (_, index) => index % 2 === 0
+            ? { id: `turn-${index}`, status: 'completed', items: [{
+                id: `user-item-${index}`, type: 'userMessage', clientId: `user-${index}`,
+                content: [{ type: 'text', text: `prompt-${index}` }]
+            }] }
+            : { id: `turn-${index}`, status: 'completed', items: [{
+                id: `assistant-item-${index}`, type: 'agentMessage', text: `reply-${index}`
+            }] });
+        turns.push({
+            id: 'active', status: 'inProgress', items: [
+                { id: 'active-user-item', type: 'userMessage', clientId: 'active-user', content: [{ type: 'text', text: 'active prompt' }] },
+                { id: 'active-assistant-item', type: 'agentMessage', text: 'partial' }
+            ]
+        });
+
+        await projection.history({ turns });
+
+        expect(updateMetadata).toHaveBeenCalledTimes(1);
+        expect(Object.keys(metadata.conversationHistoryTurns as Record<string, string>)).toHaveLength(19_001);
+        expect(user).toHaveBeenCalledTimes(19_001);
+        expect(committed).toHaveBeenCalledTimes(19_001);
+
+        await projection.notification('item/completed', {
+            threadId: 'thread',
+            turnId: 'active',
+            item: { id: 'active-assistant-item', type: 'agentMessage', text: 'final' }
+        });
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'final' }), expect.any(String));
+    }, 30_000);
+
+    it('preserves a final notification that arrives while an active history snapshot is replaying', async () => {
+        let release!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const send = vi.fn();
+        const committed = vi.fn(async (id: string) => {
+            if (id === 'active-user') await blocked;
+        });
+        const session = {
+            getMetadata: () => ({}),
+            updateMetadata: vi.fn(),
+            sendAgentMessage: send,
+            sendUserMessage: vi.fn(() => true)
+        } as unknown as ApiSessionClient;
+        const projection = new SharedCodexProjection(session, 'thread', committed);
+        const replay = projection.history({
+            turns: [{
+                id: 'active', status: 'inProgress', items: [
+                    { id: 'active-user-item', type: 'userMessage', clientId: 'active-user', content: [{ type: 'text', text: 'prompt' }] },
+                    { id: 'active-assistant-item', type: 'agentMessage', text: 'partial' }
+                ]
+            }]
+        });
+        await vi.waitFor(() => expect(committed).toHaveBeenCalledWith('active-user'));
+
+        await projection.notification('item/completed', {
+            threadId: 'thread',
+            turnId: 'active',
+            item: { id: 'active-assistant-item', type: 'agentMessage', text: 'final' }
+        });
+        release();
+        await replay;
+
+        const finals = send.mock.calls.filter(([body]) => body.type === 'message' && body.message === 'final');
+        expect(finals).toHaveLength(1);
+    });
+
     it.each([undefined, 'root'])('emits canonical error flags for tools (parent: %s)', async parentThreadId => {
         const send = vi.fn();
         const session = { getMetadata: () => ({}), sendAgentMessage: send } as unknown as ApiSessionClient;

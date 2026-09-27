@@ -13,6 +13,8 @@ vi.mock('../codexAppServerClient', () => ({
     CodexAppServerClient: class {
         initialized = false;
         thread = { id: 'thread', turns: [] as NativeTurn[] };
+        historyReads = 0;
+        resumeReads = 0;
         settings: Record<string, unknown> = { model: 'mock', collaborationMode: { mode: 'default' } };
         queue: Array<{ id: string; clientUserMessageId: unknown; input: unknown }> = [];
         notify?: (method: string, params: unknown) => void;
@@ -25,7 +27,15 @@ vi.mock('../codexAppServerClient', () => ({
         isInitialized() { return this.initialized; }
         async disconnect() { this.initialized = false; }
         async request(method: string, params: Record<string, unknown> = {}) {
-            if (method === 'thread/read' || method === 'thread/resume') return { ...this.settings, thread: structuredClone(this.thread) };
+            if (method === 'thread/read') {
+                this.historyReads++;
+                return { ...this.settings, thread: structuredClone(this.thread) };
+            }
+            if (method === 'thread/resume') {
+                this.resumeReads++;
+                return { ...this.settings, thread: structuredClone(this.thread) };
+            }
+            if (method === 'thread/turns/list') return { data: structuredClone(this.thread.turns) };
             if (method === 'thread/list') return { data: [] };
             if (method === 'thread/queue/list') return { data: this.queue };
             if (method === 'thread/settings/update') {
@@ -53,7 +63,7 @@ afterEach(async () => {
     finally { vi.useRealTimers(); }
 });
 
-async function fixture() {
+async function fixture(initialTurns: NativeTurn[] = []) {
     const directory = await mkdtemp('/tmp/hapi-shared-root-');
     let state: AgentState = { steeringActive: true };
     let metadata: Metadata = { path: directory, host: 'test', flavor: 'codex' };
@@ -79,14 +89,17 @@ async function fixture() {
     } satisfies RootHost);
     cleanups.push(async () => { await root.close(false); await rm(directory, { recursive: true, force: true }); });
     await root.prepare();
-    await root.bind('thread', { model: 'mock', thread: { turns: [] } }, false);
     const native = root.client as unknown as {
         initialized: boolean;
-        thread: { id: string; turns: NativeTurn[] };
+        thread: { id: string; turns: NativeTurn[]; historyMode?: string };
+        historyReads: number;
+        resumeReads: number;
         queue: Array<{ id: string; clientUserMessageId: string; input: unknown }>;
         notify(method: string, params: unknown): void;
         abandoned(): void;
     };
+    native.thread.turns = initialTurns;
+    await root.bind('thread', { model: 'mock', thread: { turns: initialTurns } }, false);
     return { root, native, rpc, send, metadata: () => metadata, state: () => state, updateState, reconnect: () => reconnect?.() };
 }
 
@@ -297,6 +310,71 @@ describe('shared plan actions', () => {
 });
 
 describe('shared steering availability', () => {
+    it('reuses a complete resume snapshot instead of reading history again during bind', async () => {
+        const turns = [{ id: 'turn', status: 'completed', items: [{ id: 'item', type: 'agentMessage', text: 'reply' }] }];
+        const f = await fixture(turns);
+
+        expect(f.native.historyReads).toBe(0);
+        expect(f.native.resumeReads).toBe(0);
+        expect(f.send).toHaveBeenCalledTimes(1);
+    });
+
+    it('reuses the reconnect resume snapshot instead of performing a second full read', async () => {
+        const turns = [{ id: 'turn', status: 'completed', items: [{ id: 'item', type: 'agentMessage', text: 'reply' }] }];
+        const f = await fixture(turns);
+        f.native.historyReads = 0;
+        f.native.initialized = false;
+        f.native.abandoned();
+
+        await vi.waitFor(() => expect(f.native.resumeReads).toBe(1));
+        await vi.waitFor(() => expect(f.native.historyReads).toBe(0));
+    });
+
+    it('prefers a reconnect snapshot that arrives during an existing fallback refresh', async () => {
+        const f = await fixture();
+        const request = f.root.client.request.bind(f.root.client);
+        let release!: () => void;
+        let entered!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        const reading = new Promise<void>(resolve => { entered = resolve; });
+        const spy = vi.spyOn(f.root.client, 'request').mockImplementation(async (method, params) => {
+            if (method === 'thread/read') {
+                entered();
+                await blocked;
+            }
+            return request(method, params);
+        });
+        const first = f.root.refresh();
+        await reading;
+        const snapshot = {
+            id: 'thread',
+            turns: [{ id: 'new', status: 'completed', items: [{ id: 'new-item', type: 'agentMessage', text: 'new reply' }] }]
+        };
+        const second = f.root.refresh(snapshot);
+        release();
+        await second;
+        await first;
+
+        expect(spy.mock.calls.filter(([method]) => method === 'thread/read')).toHaveLength(1);
+        expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'new reply' }), expect.any(String));
+    });
+
+    it('falls back to paginated native history when a snapshot is not complete', async () => {
+        const f = await fixture();
+        f.native.thread.historyMode = 'paginated';
+        f.native.thread.turns = [{ id: 'native-turn', status: 'completed', items: [{ id: 'native-item', type: 'agentMessage', text: 'native reply' }] }];
+        f.native.historyReads = 0;
+
+        await f.root.refresh({
+            historyMode: 'paginated',
+            turns: [{ id: 'partial-turn', status: 'completed', items: [] }]
+        });
+
+        expect(f.native.historyReads).toBe(1);
+        expect(f.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: 'native reply' }), expect.any(String));
+        expect(f.send).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'partial reply' }), expect.any(String));
+    });
+
     it('keeps idle sessions online without polling usage or publishing agent-state updates', async () => {
         const f = await fixture();
         const requests = vi.spyOn(f.root.client, 'request');

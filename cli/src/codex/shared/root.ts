@@ -61,6 +61,7 @@ export class SharedCodexRoot {
     private turnRevision = 0;
     private settingsRevision = 0;
     private refreshing?: Promise<void>;
+    private pendingRefreshSnapshot?: Record<string, unknown>;
     private interrupted = false;
     private closed = false;
     private stopping = false;
@@ -217,7 +218,11 @@ export class SharedCodexRoot {
         }));
         if (subscribe) response = record(await this.client.request('thread/resume', { threadId }));
         this.acceptSettings(response); this.acceptSettings(this.host.settingsFor(threadId) ?? {});
-        await this.projection.history(response.thread); await this.refresh(); await this.refreshChildren(true);
+        // Lifecycle responses already carry a complete history snapshot on
+        // compatible app-servers. Reuse it for reconciliation and projection;
+        // reading the same history again doubles peak memory and metadata work.
+        await this.refresh(this.completeThreadSnapshot(response.thread));
+        await this.refreshChildren(true);
     }
     async activate(options: SharedLaunchOptions = {}): Promise<void> {
         // Restored input cannot run before the cold-resume settings are applied.
@@ -290,8 +295,17 @@ export class SharedCodexRoot {
         if (method === 'thread/queue/changed') await this.queue.reconcile();
         await this.projection.notification(method, params, modelAtReceipt); this.alive();
     }
-    async readThread(threadId = this.threadId): Promise<Record<string, unknown>> {
+    private completeThreadSnapshot(value: unknown): Record<string, unknown> | undefined {
+        const thread = record(value);
+        return Array.isArray(thread.turns) && thread.historyMode !== 'paginated' ? thread : undefined;
+    }
+    async readThread(threadId = this.threadId, preferPendingSnapshot = false): Promise<Record<string, unknown>> {
         let thread = record(record(await this.client.request('thread/read', { threadId, includeTurns: false })).thread);
+        if (preferPendingSnapshot && threadId === this.threadId && this.pendingRefreshSnapshot) {
+            const snapshot = this.pendingRefreshSnapshot;
+            this.pendingRefreshSnapshot = undefined;
+            return snapshot;
+        }
         if (thread.historyMode === 'paginated') {
             const turns: unknown[] = []; let cursor: string | undefined;
             do {
@@ -303,13 +317,33 @@ export class SharedCodexRoot {
         } else thread = record(record(await this.client.request('thread/read', { threadId, includeTurns: true })).thread);
         return thread;
     }
-    refresh(): Promise<void> {
-        return this.refreshing ??= this.refreshNow().finally(() => { this.refreshing = undefined; });
+    refresh(snapshot?: Record<string, unknown>): Promise<void> {
+        const complete = snapshot ? this.completeThreadSnapshot(snapshot) : undefined;
+        if (complete) this.pendingRefreshSnapshot = complete;
+        return this.refreshing ??= this.refreshLoop().finally(() => { this.refreshing = undefined; });
     }
-    private async refreshNow(): Promise<void> {
+    private async refreshLoop(): Promise<void> {
+        do {
+            const snapshot = this.pendingRefreshSnapshot;
+            this.pendingRefreshSnapshot = undefined;
+            await this.refreshNow(snapshot);
+        } while (this.pendingRefreshSnapshot);
+    }
+    private async refreshNow(snapshot?: Record<string, unknown>): Promise<void> {
         if (!this.threadId || this.closed || !this.client.isInitialized()) return;
         const revision = this.turnRevision;
-        const thread = await this.readThread();
+        let thread: Record<string, unknown>;
+        if (snapshot) {
+            thread = snapshot;
+        } else {
+            thread = await this.readThread(this.threadId, true);
+            // A reconnect snapshot may arrive while the fallback read is in
+            // flight. Prefer that newer native state without a second read.
+            if (this.pendingRefreshSnapshot) {
+                thread = this.pendingRefreshSnapshot;
+                this.pendingRefreshSnapshot = undefined;
+            }
+        }
         const turns = Array.isArray(thread.turns) ? thread.turns.map(record) : [];
         if (revision === this.turnRevision) {
             this.currentTurn = string(turns.find(turn => turn.status === 'inProgress')?.id);
@@ -369,7 +403,9 @@ export class SharedCodexRoot {
                     const observedSettings = this.settingsRevision !== settingsRevision;
                     this.acceptSettings(response);
                     if (!observedSettings) this.acceptSettings(this.host.settingsFor(this.threadId) ?? {});
-                    this.projection.reset(); await this.refresh(); this.queue.replay(); await this.refreshChildren(true);
+                    this.projection.reset();
+                    await this.refresh(this.completeThreadSnapshot(response.thread));
+                    this.queue.replay(); await this.refreshChildren(true);
                     return;
                 } catch (error) {
                     this.permissions.close();

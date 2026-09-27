@@ -27,11 +27,21 @@ function successfulTitle(item: Record<string, unknown>, pending?: string): strin
     return requestedTitle(item) ?? pending;
 }
 
+type HistoryMetadataBatch = {
+    dirty: boolean;
+    points: Set<string>;
+};
+
 /** Canonical V2 stream only. Stable message IDs also deduplicate snapshot replay at the hub. */
 export class SharedCodexProjection {
     private converter = new AppServerEventConverter();
     private readonly emitted = new Set<string>();
     private readonly turns = new Map<string, string>();
+    private readonly firstMessageByTurn = new Map<string, string>();
+    // Delivery evidence is scoped to this projection generation. Persisted
+    // native locators are fork boundaries, not Hub ACKs; reconnect replay must
+    // therefore send their stable IDs again.
+    private readonly projectedUsers = new Set<string>();
     private readonly turnModels = new Map<string, string>();
     // Unlike transcript emission, title side effects survive reset/replay.
     private readonly pendingTitles = new Map<string, string>();
@@ -39,11 +49,18 @@ export class SharedCodexProjection {
     private titleRevision = 0;
     constructor(private readonly session: ApiSessionClient, readonly threadId: string,
         private readonly committed: (id: string) => Promise<void>, private readonly parentThreadId?: string) {
-        if (!parentThreadId) for (const [id, turn] of Object.entries(session.getMetadata()?.conversationHistoryTurns ?? {})) this.turns.set(id, turn);
+        if (!parentThreadId) for (const [id, turn] of Object.entries(session.getMetadata()?.conversationHistoryTurns ?? {})) {
+            this.turns.set(id, turn);
+            if (!this.firstMessageByTurn.has(turn)) this.firstMessageByTurn.set(turn, id);
+        }
     }
 
     turnFor(id: string): string | undefined { return this.turns.get(id); }
-    reset(): void { this.converter = new AppServerEventConverter(); this.emitted.clear(); }
+    reset(): void {
+        this.converter = new AppServerEventConverter();
+        this.emitted.clear();
+        this.projectedUsers.clear();
+    }
     private send(body: Record<string, unknown>, key: string): void {
         if (this.emitted.has(key)) return;
         this.emitted.add(key);
@@ -78,7 +95,8 @@ export class SharedCodexProjection {
         await this.project(method, params, modelAtReceipt);
     }
 
-    private async project(method: string, params: unknown, modelAtReceipt?: string): Promise<void> {
+    private async project(method: string, params: unknown, modelAtReceipt?: string,
+        historyMetadata?: HistoryMetadataBatch): Promise<void> {
         if (method.startsWith('codex/event/')) return;
         const p = record(params);
         const item = record(p.item);
@@ -95,19 +113,35 @@ export class SharedCodexProjection {
         if (!this.parentThreadId && (method === 'item/started' || method === 'item/completed') && item.type === 'userMessage') {
             const id = string(item.clientId ?? item.clientUserMessageId) ?? (itemId ? `codex:${this.threadId}:user:${itemId}` : undefined);
             if (id) {
-                const firstInTurn = turnId ? [...this.turns].find(([, value]) => value === turnId)?.[0] : undefined;
-                if (turnId) this.turns.set(id, turnId);
-                const text = inputText(item.content);
-                if (text && this.session.sendUserMessage(text, undefined, id) === false) {
-                    throw new Error(`Failed to deliver Codex user message ${id}`);
+                const firstInTurn = turnId ? this.firstMessageByTurn.get(turnId) : undefined;
+                const isFirstInTurn = Boolean(turnId && (!firstInTurn || firstInTurn === id));
+                const alreadyProjected = this.projectedUsers.has(id);
+                if (historyMetadata && isFirstInTurn) {
+                    historyMetadata.dirty = true;
+                    historyMetadata.points.add(id);
                 }
-                // Commit only after the message has been accepted by the CLI
-                // transport. A bounded disconnected-transport failure must
-                // leave the native localId replayable on the next recovery.
-                await this.committed(id);
-                this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
-                    ...(turnId && (!firstInTurn || firstInTurn === id) ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
-                }));
+                if (!alreadyProjected) {
+                    const text = inputText(item.content);
+                    if (text && this.session.sendUserMessage(text, undefined, id) === false) {
+                        throw new Error(`Failed to deliver Codex user message ${id}`);
+                    }
+                    // Commit only after the message has been accepted by the CLI
+                    // transport. A bounded disconnected-transport failure must
+                    // leave the native localId replayable on the next recovery.
+                    await this.committed(id);
+                    this.projectedUsers.add(id);
+                    if (turnId) {
+                        this.turns.set(id, turnId);
+                        if (!firstInTurn) this.firstMessageByTurn.set(turnId, id);
+                    }
+                    if (!historyMetadata) {
+                        this.session.updateMetadata(metadata => ({ ...metadata, conversationHistoryTurns: Object.fromEntries(this.turns),
+                            ...(isFirstInTurn ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, [id]: true } } : {})
+                        }));
+                    }
+                } else if (turnId && !firstInTurn) {
+                    this.firstMessageByTurn.set(turnId, id);
+                }
             }
         }
         if (this.parentThreadId && (method === 'turn/started' || method === 'turn/completed')) {
@@ -173,6 +207,7 @@ export class SharedCodexProjection {
         const turns = record(thread).turns;
         if (!Array.isArray(turns)) return;
         const titleRevision = this.titleRevision;
+        const historyMetadata: HistoryMetadataBatch = { dirty: false, points: new Set() };
         let latestTitle: string | undefined;
         for (const value of turns) {
             const turn = record(value);
@@ -184,7 +219,7 @@ export class SharedCodexProjection {
                 if (!this.parentThreadId && string(record(item).id) && pendingTitle && !this.completedTitles.has(titleKey)) {
                     this.pendingTitles.set(titleKey, pendingTitle);
                 }
-                await this.project('item/started', params);
+                await this.project('item/started', params, undefined, historyMetadata);
                 // Active snapshots can contain partial assistant text. Do not
                 // settle it under the final stable id and suppress completion.
                 if (turn.status !== 'inProgress' || record(item).status === 'completed' || record(item).type === 'userMessage') {
@@ -196,9 +231,19 @@ export class SharedCodexProjection {
                         }
                         this.pendingTitles.delete(titleKey);
                     }
-                    await this.project('item/completed', params);
+                    await this.project('item/completed', params, undefined, historyMetadata);
                 }
             }
+        }
+        if (!this.parentThreadId && historyMetadata.dirty) {
+            const points = Object.fromEntries([...historyMetadata.points].map(id => [id, true as const]));
+            this.session.updateMetadata(metadata => ({
+                ...metadata,
+                conversationHistoryTurns: Object.fromEntries(this.turns),
+                ...(Object.keys(points).length > 0
+                    ? { conversationHistoryPoints: { ...metadata.conversationHistoryPoints, ...points } }
+                    : {})
+            }));
         }
         // Repair sessions created while remote title projection was missing.
         // Recheck inside the metadata lock: live updates may still be queued,

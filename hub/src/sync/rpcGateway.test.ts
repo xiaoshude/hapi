@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test'
-import { CODEX_RESUME_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
+import { CODEX_RESUME_RPC_TIMEOUT_MS, CODEX_STEER_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
 import type { Server } from 'socket.io'
 import type { RpcRegistry } from '../socket/rpcRegistry'
 import { RpcGateway, RpcTargetMissingError } from './rpcGateway'
 
-function createGateway() {
+function createGateway(ackError?: Error) {
     const timeouts: number[] = []
     const calls: Array<{ method: string; params: string }> = []
     const socket = {
@@ -13,6 +13,7 @@ function createGateway() {
             return {
                 async emitWithAck(_event: string, payload: { method: string; params: string }) {
                     calls.push(payload)
+                    if (ackError) throw ackError
                     if (payload.method.endsWith(':cursor-chat-store-status')) {
                         return JSON.stringify({ onDisk: false, store: null })
                     }
@@ -69,6 +70,23 @@ describe('RpcGateway RPC timeouts', () => {
         )
 
         expect(timeouts).toEqual([CODEX_RESUME_RPC_TIMEOUT_MS])
+    })
+
+    it('uses the extended RPC timeout for queued steer', async () => {
+        const { gateway, calls, timeouts } = createGateway()
+
+        await gateway.steerQueuedMessage('session-1', 'local-1')
+
+        expect(timeouts).toEqual([CODEX_STEER_RPC_TIMEOUT_MS])
+        expect(calls[0]?.method).toBe('session-1:steer-queued-message')
+    })
+
+    it('propagates a queued-steer timeout as an indeterminate RPC failure', async () => {
+        const timeout = new Error('operation has timed out')
+        const { gateway, timeouts } = createGateway(timeout)
+
+        await expect(gateway.steerQueuedMessage('session-1', 'local-1')).rejects.toThrow(timeout)
+        expect(timeouts).toEqual([CODEX_STEER_RPC_TIMEOUT_MS])
     })
 
     it('keeps the default RPC timeout for new Codex sessions', async () => {

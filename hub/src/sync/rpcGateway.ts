@@ -1,6 +1,6 @@
 import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionMode } from '@hapi/protocol/types'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
-import { CODEX_RESUME_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
+import { CODEX_RESUME_RPC_TIMEOUT_MS, CODEX_STEER_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
 import {
     ArchiveCodexSessionRpcResponseSchema,
     AgentAvailabilityResponseSchema,
@@ -474,7 +474,7 @@ export class RpcGateway {
         sessionId: string,
         localId: string
     ): Promise<{ steered: boolean; error?: string }> {
-        return await this.sessionRpc(sessionId, RPC_METHODS.SteerQueuedMessage, { localId }) as {
+        return await this.sessionRpc(sessionId, RPC_METHODS.SteerQueuedMessage, { localId }, CODEX_STEER_RPC_TIMEOUT_MS) as {
             steered: boolean
             error?: string
         }

@@ -16,7 +16,7 @@ def verify(base):
         with opener.open(base.rstrip('/') + path, timeout=5) as response:
             return response.read(16 * 1024 * 1024).decode('utf-8')
     html = read('/')
-    scripts = re.findall(r'<script[^>]+src="(/assets/[^"?]+\.js)"', html)
+    scripts = re.findall(r'(?:src|href)="(/assets/[^"?]+\.js)"', html)
     if not scripts:
         raise ValueError('No application script found')
     bundles = '\n'.join(read(path) for path in scripts)
@@ -24,6 +24,10 @@ def verify(base):
         raise ValueError('Historical runner failure is rendered on NewSession')
     if 'Previous session launch failure' not in bundles:
         raise ValueError('Historical machine diagnostics are absent from this release')
+    if r'(?<=^|\s|\p{P}|\p{S})' in bundles:
+        raise ValueError('iOS 15 incompatible GFM email lookbehind is present')
+    if r'(^|[\s\p{P}\p{S}])' not in bundles:
+        raise ValueError('Required iOS 15 GFM compatibility implementation is absent')
     return scripts
 
 

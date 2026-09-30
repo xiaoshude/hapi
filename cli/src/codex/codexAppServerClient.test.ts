@@ -358,7 +358,7 @@ describe('CodexAppServerClient history request timeouts', () => {
             if (!('error' in result)) throw new Error('Expected the typed history request to time out');
             expect(result.error).toBeInstanceOf(Error);
             expect((result.error as Error).message).toContain(
-                `timed out after ${CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
+                `timed out after ${_method === 'thread/start' ? 60_000 : CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
             );
         } finally {
             vi.useRealTimers();

@@ -89,12 +89,12 @@ describe('RpcGateway RPC timeouts', () => {
         expect(timeouts).toEqual([CODEX_STEER_RPC_TIMEOUT_MS])
     })
 
-    it('keeps the default RPC timeout for new Codex sessions', async () => {
+    it('keeps fresh Codex RPC above the Runner startup deadline', async () => {
         const { gateway, timeouts } = createGateway()
 
         await gateway.spawnSession('machine-1', '/workspace', 'codex')
 
-        expect(timeouts).toEqual([30_000])
+        expect(timeouts).toEqual([150_000])
     })
 
     it('keeps the default RPC timeout when resuming another agent', async () => {

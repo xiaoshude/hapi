@@ -335,6 +335,41 @@ describe('CodexAppServerClient history request timeouts', () => {
         }
     );
 
+    it.each([
+        ['thread/start', (client: CodexAppServerClient) => client.startThread({} as never)],
+        ['thread/start (generic)', (client: CodexAppServerClient) => client.request('thread/start', {})],
+        ['thread/read', (client: CodexAppServerClient) => client.readThread({} as never)],
+        ['thread/resume', (client: CodexAppServerClient) => client.resumeThread({} as never)],
+        ['thread/fork', (client: CodexAppServerClient) => client.forkThread({} as never)]
+    ] as const)('uses the dedicated history timeout for typed %s', async (_method, invoke) => {
+        const child = fakeChild();
+        child.stdin.write = vi.fn((_data: unknown, callback?: (error?: Error | null) => void) => {
+            callback?.();
+            return true;
+        });
+        spawnMock.mockReturnValue(child);
+        const client = new CodexAppServerClient({ cwd: '/neutral-home' });
+        await client.connect();
+        vi.useFakeTimers();
+
+        try {
+            const pending = invoke(client).then(
+                value => ({ value }),
+                error => ({ error })
+            );
+            await vi.advanceTimersByTimeAsync(CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS);
+            const result = await pending;
+            if (!('error' in result)) throw new Error('Expected the typed history request to time out');
+            expect(result.error).toBeInstanceOf(Error);
+            expect((result.error as Error).message).toContain(
+                `timed out after ${_method.startsWith('thread/start') ? 60_000 : CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
+            );
+        } finally {
+            vi.useRealTimers();
+            await client.disconnect();
+        }
+    });
+
     it('bounds a stalled history request at its dedicated timeout', async () => {
         const { child, client } = await connectedClientWithWritableStdin();
         vi.useFakeTimers();
@@ -391,7 +426,7 @@ describe('CodexAppServerClient history request timeouts', () => {
         }
     );
 
-    it.each(['thread/start', 'thread/compact/start', 'turn/start'])(
+    it.each(['thread/compact/start', 'turn/start'])(
         'keeps %s on the interactive deadline', async method => {
             const { child, client } = await connectedClientWithWritableStdin();
             vi.useFakeTimers();

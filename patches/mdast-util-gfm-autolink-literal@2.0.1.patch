@@ -1,0 +1,50 @@
+diff --git a/lib/index.js b/lib/index.js
+index c5ca771c24dd914e342f791716a822431ee32b3a..df24032e7c4040cfeaaf42f6801fd0e5b8d76ffb 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -132,7 +132,7 @@ function transformGfmAutolinkLiterals(tree) {
+     tree,
+     [
+       [/(https?:\/\/|www(?=\.))([-.\w]+)([^ \t\r\n]*)/gi, findUrl],
+-      [/(?<=^|\s|\p{P}|\p{S})([-.\w+]+)@([-\w]+(?:\.[-\w]+)+)/gu, findEmail]
++      [/(^|[\s\p{P}\p{S}])([-.\w+]+)@([-\w]+(?:\.[-\w]+)+)/gu, findEmail]
+     ],
+     {ignore: ['link', 'linkReference']}
+   )
+@@ -189,27 +189,32 @@ function findUrl(_, protocol, domain, path, match) {
+ /**
+  * @type {ReplaceFunction}
+  * @param {string} _
++ * @param {string} boundary
+  * @param {string} atext
+  * @param {string} label
+  * @param {RegExpMatchObject} match
+- * @returns {Link | false}
++ * @returns {Array<PhrasingContent> | Link | false}
+  */
+-function findEmail(_, atext, label, match) {
++function findEmail(_, boundary, atext, label, match) {
++  const emailMatch = {...match, index: match.index + boundary.length}
++
+   if (
+     // Not an expected previous character.
+-    !previous(match, true) ||
++    !previous(emailMatch, true) ||
+     // Label ends in not allowed character.
+     /[-\d_]$/.test(label)
+   ) {
+     return false
+   }
+ 
+-  return {
++  const link = {
+     type: 'link',
+     title: null,
+     url: 'mailto:' + atext + '@' + label,
+     children: [{type: 'text', value: atext + '@' + label}]
+   }
++
++  return boundary ? [{type: 'text', value: boundary}, link] : link
+ }
+ 
+ /**

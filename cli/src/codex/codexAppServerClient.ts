@@ -6,6 +6,7 @@ import { JsonLineParser } from '@/utils/jsonLineParser';
 import { killProcessByChildProcess } from '@/utils/process';
 import {
     CODEX_HISTORY_REQUEST_TIMEOUT_MS,
+    CODEX_START_REQUEST_TIMEOUT_MS,
     CODEX_INTERACTIVE_REQUEST_TIMEOUT_MS
 } from '@hapi/protocol/codexTimeouts';
 import type {
@@ -356,7 +357,9 @@ export class CodexAppServerClient extends JsonLineParser {
         // These operations may need to replay or materialize a long persisted
         // conversation before the app-server can return a response. Keep the
         // short deadline for interactive RPCs that should acknowledge quickly.
-        const timeoutMs = options?.timeoutMs ?? (HISTORY_REQUEST_METHODS.has(method)
+        const timeoutMs = options?.timeoutMs ?? (method === 'thread/start'
+            ? CODEX_START_REQUEST_TIMEOUT_MS
+            : HISTORY_REQUEST_METHODS.has(method)
             ? CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS
             : CodexAppServerClient.INTERACTIVE_REQUEST_TIMEOUT_MS);
         return await this.sendRequest(method, params, { timeoutMs }) as T;
@@ -407,7 +410,7 @@ export class CodexAppServerClient extends JsonLineParser {
     async startThread(params: ThreadStartParams, options?: { signal?: AbortSignal }): Promise<ThreadStartResponse> {
         const response = await this.sendRequest('thread/start', params, {
             signal: options?.signal,
-            timeoutMs: CodexAppServerClient.DEFAULT_TIMEOUT_MS
+            timeoutMs: CODEX_START_REQUEST_TIMEOUT_MS
         });
         return response as ThreadStartResponse;
     }

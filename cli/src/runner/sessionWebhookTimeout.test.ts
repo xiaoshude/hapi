@@ -8,6 +8,11 @@ import {
 import { resolveSessionWebhookTimeoutMs } from './sessionWebhookTimeout';
 
 describe('resolveSessionWebhookTimeoutMs', () => {
+    it('gives fresh Codex startup headroom over native initialization and thread creation', () => {
+        expect(resolveSessionWebhookTimeoutMs({ agent: 'codex' }, {})).toBe(120_000);
+        expect(resolveSessionWebhookTimeoutMs({ agent: 'codex' }, { HAPI_RUNNER_WEBHOOK_TIMEOUT_MS: '5000' })).toBe(120_000);
+        expect(resolveSessionWebhookTimeoutMs({ agent: 'codex' }, { HAPI_RUNNER_WEBHOOK_TIMEOUT_MS: '180000' })).toBe(180_000);
+    });
     it('preserves the configured timeout for ordinary spawns', () => {
         expect(resolveSessionWebhookTimeoutMs(
             { agent: 'claude' },

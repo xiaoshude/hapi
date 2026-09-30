@@ -1,3 +1,4 @@
+import { formatRunnerSpawnError } from '@/utils/formatRunnerSpawnError'
 import { useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { MACHINE_DISPLAY_NAME_MAX_LENGTH } from '@hapi/protocol'
@@ -21,6 +22,7 @@ function MachineRow(props: { api: ApiClient | null; machine: Machine }) {
     const label = getMachineTitle(props.machine)
     const host = props.machine.metadata?.host
     const platform = props.machine.metadata?.platform
+    const previousLaunchError = formatRunnerSpawnError(props.machine)
     const subtitle = [host, platform].filter(Boolean).join(' · ')
 
     const renameMutation = useMutation({
@@ -105,6 +107,13 @@ function MachineRow(props: { api: ApiClient | null; machine: Machine }) {
                     ) : null}
                 </div>
             </div>
+            {previousLaunchError ? (
+                <details className="mt-2 text-xs text-[var(--app-hint)]">
+                    <summary>{t('settings.machines.previousLaunchFailure')}</summary>
+                    <p className="mt-1">{t('settings.machines.previousLaunchFailureDescription')}</p>
+                    <pre className="mt-1 whitespace-pre-wrap break-words">{previousLaunchError}</pre>
+                </details>
+            ) : null}
             {error ? <div role="alert" className="mt-1 text-xs text-red-600 dark:text-red-400">{error}</div> : null}
         </div>
     )

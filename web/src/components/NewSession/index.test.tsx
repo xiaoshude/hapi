@@ -12,6 +12,7 @@ import {
 
 const mocks = vi.hoisted(() => ({
     spawnSession: vi.fn(),
+    spawnError: null as string | null,
     onSuccess: vi.fn(),
     notification: vi.fn(),
     checkPathsExists: vi.fn(),
@@ -52,7 +53,7 @@ vi.mock('@/hooks/mutations/useSpawnSession', () => ({
     useSpawnSession: () => ({
         spawnSession: mocks.spawnSession,
         isPending: false,
-        error: null
+        error: mocks.spawnError
     })
 }))
 vi.mock('@/hooks/queries/useSessions', () => ({
@@ -279,6 +280,7 @@ describe('NewSession launch preferences', () => {
         localStorage.clear()
         sessionStorage.clear()
         mocks.spawnSession.mockReset()
+        mocks.spawnError = null
         mocks.onSuccess.mockReset()
         mocks.notification.mockReset()
         mocks.checkPathsExists.mockReset()
@@ -312,6 +314,12 @@ describe('NewSession launch preferences', () => {
         mocks.refetchSessions.mockResolvedValue(undefined)
         mocks.addToast.mockReset()
         savePreferredAgent('codex')
+    })
+
+    it('still shows the error returned by the current create request', () => {
+        mocks.spawnError = 'Current create failed'
+        render(<NewSession api={api} machines={[machine]} initialMachineId="machine-1" initialDirectory="C:\\repo" onSuccess={mocks.onSuccess} onCancel={() => {}} />)
+        expect(screen.getByText('Current create failed')).toBeTruthy()
     })
 
     it('does not show an earlier resume failure as a new-session error', () => {

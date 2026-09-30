@@ -1,6 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdir, mkdtemp, chmod, rm, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, chmod, rm, realpath, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
@@ -345,7 +345,22 @@ export async function runSharedRuntime(options: SharedLaunchOptions, onReady?: (
         }
         if (options.resumeSessionId) {
             const threadId = options.resumeSessionId;
-            const thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+            let thread: Record<string, unknown>;
+            try {
+                thread = record(record(await control.request('thread/read', { threadId, includeTurns: false })).thread);
+                // Native read may return SQLite metadata even after retention removed the rollout.
+                const rolloutPath = string(thread.path);
+                if (rolloutPath) await access(rolloutPath);
+            } catch (error) {
+                if (error instanceof Error && (
+                    /^(no rollout found for thread id |thread not loaded: )/.test(error.message)
+                    || /^failed to resolve rollout path `[^`]+`: file does not exist$/.test(error.message)
+                    || ('code' in error && error.code === 'ENOENT')
+                )) {
+                    throw new Error(`CODEX_HISTORY_MISSING: Cannot resume Codex thread ${threadId}: its local history is unavailable on this machine. Restore the original rollout from an archive or backup, or create a separate new session. The existing session has not been replaced.`, { cause: error });
+                }
+                throw error;
+            }
             if (string(thread.parentThreadId)) {
                 throw new Error('Cannot cold-resume a child agent independently. Resume its parent HAPI session instead.');
             }

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AgentState, Metadata } from '@/api/types';
@@ -48,6 +48,44 @@ vi.mock('../utils/buildHapiMcpBridge', () => ({ buildHapiMcpBridge: async () => 
 // Explicit opt-in: installed official binary, entirely isolated CODEX_HOME, mock Responses API only.
 describe.skipIf(process.env.HAPI_RUN_SHARED_CODEX_TESTS !== '1')('installed Codex shared runtime', () => {
     afterEach(() => { vi.unstubAllEnvs(); state.sessions.clear(); state.beforeBootstrap = undefined; });
+    it.each([false, true])('explains a missing rollout before changing a binding (stale index: %s)', async (staleIndex) => {
+        const home = await mkdtemp('/tmp/hapi-missing-rollout-'); state.home = home;
+        const ch = join(home, 'codex'); await mkdir(ch);
+        vi.stubEnv('CODEX_HOME', ch); vi.stubEnv('HOME', home);
+        let threadId = '11111111-1111-4111-8111-111111111111';
+        if (staleIndex) {
+            threadId = randomUUID();
+            const directory = join(ch, 'sessions', '2026', '01', '01');
+            await mkdir(directory, { recursive: true });
+            const rollout = join(directory, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+            await writeFile(rollout, JSON.stringify({ timestamp: '2026-01-01T00:00:00.000Z', type: 'session_meta', payload: {
+                id: threadId, timestamp: '2026-01-01T00:00:00.000Z', cwd: home,
+                originator: 'codex_cli_rs', cli_version: '0.154.0', source: 'cli', model_provider: 'openai'
+            } }) + '\n');
+            const native = new CodexAppServerClient({ cwd: home });
+            try {
+                await initializeSharedClient(native);
+                const resumed = record(record(await native.request('thread/resume', { threadId })).thread);
+                expect(resumed.id).toBe(threadId);
+                await native.request('thread/metadata/update', { threadId, gitInfo: { branch: 'missing-history-test' } });
+            } finally { await native.disconnect(); }
+            const rollouts = (await readdir(join(ch, 'sessions'), { recursive: true }))
+                .filter(path => path.endsWith(`${threadId}.jsonl`));
+            expect(rollouts).toHaveLength(1);
+            await rm(join(ch, 'sessions', rollouts[0]));
+            // Real native resume indexed this rollout. Leave SQLite intact;
+            // a fresh engine now encounters the missing file, without mocks.
+        }
+        const ready = vi.fn();
+        try {
+            const { runSharedRuntime } = await import('./runtime');
+            await expect(runSharedRuntime({ workingDirectory: home, resumeSessionId: threadId }, ready))
+                .rejects.toThrow('CODEX_HISTORY_MISSING');
+            expect(ready).not.toHaveBeenCalled();
+            expect(state.sessions.size).toBe(0);
+        } finally { await rm(home, { recursive: true, force: true }); }
+    }, 30_000);
+
     it('rejects a child ID before creating a HAPI binding or calling native resume', async () => {
         const home = await mkdtemp('/tmp/hapi-shared-child-'); state.home = home;
         const ch = join(home, 'codex'); await mkdir(ch);

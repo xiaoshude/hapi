@@ -1,5 +1,5 @@
 import type { SpawnSessionOptions } from '@/modules/common/rpcTypes';
-import { CODEX_RESUME_WEBHOOK_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts';
+import { CODEX_RESUME_WEBHOOK_TIMEOUT_MS, CODEX_START_WEBHOOK_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts';
 
 const DEFAULT_WEBHOOK_TIMEOUT_MS = 15_000;
 
@@ -14,7 +14,8 @@ export function resolveSessionWebhookTimeoutMs(
 ): number {
     const globalTimeoutMs = parsePositiveTimeout(env.HAPI_RUNNER_WEBHOOK_TIMEOUT_MS)
         ?? DEFAULT_WEBHOOK_TIMEOUT_MS;
-    if (options.agent !== 'codex' || !options.resumeSessionId) return globalTimeoutMs;
+    if (options.agent !== 'codex') return globalTimeoutMs;
+    if (!options.resumeSessionId) return Math.max(globalTimeoutMs, CODEX_START_WEBHOOK_TIMEOUT_MS);
 
     // This value can extend the shared safety budget. It cannot shorten it
     // below the Codex history RPC deadline plus startup/cleanup headroom.

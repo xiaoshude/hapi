@@ -334,6 +334,7 @@ describe('CodexAppServerClient history request timeouts', () => {
 
     it.each([
         ['thread/start', (client: CodexAppServerClient) => client.startThread({} as never)],
+        ['thread/start (generic)', (client: CodexAppServerClient) => client.request('thread/start', {})],
         ['thread/read', (client: CodexAppServerClient) => client.readThread({} as never)],
         ['thread/resume', (client: CodexAppServerClient) => client.resumeThread({} as never)],
         ['thread/fork', (client: CodexAppServerClient) => client.forkThread({} as never)]
@@ -358,7 +359,7 @@ describe('CodexAppServerClient history request timeouts', () => {
             if (!('error' in result)) throw new Error('Expected the typed history request to time out');
             expect(result.error).toBeInstanceOf(Error);
             expect((result.error as Error).message).toContain(
-                `timed out after ${_method === 'thread/start' ? 60_000 : CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
+                `timed out after ${_method.startsWith('thread/start') ? 60_000 : CodexAppServerClient.HISTORY_REQUEST_TIMEOUT_MS}ms`
             );
         } finally {
             vi.useRealTimers();

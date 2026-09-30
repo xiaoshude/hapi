@@ -54,3 +54,11 @@ Choose checks by the change's impact, not by the number of workflow steps:
 - Within existing permissions, run and retry relevant local checks without asking at each step. Fix failures caused by the task; report unrelated failures. If tools or permissions are unavailable, complete other work and state what remains unverified; do not bootstrap native toolchains or wait on CI unless the task requires it.
 - Reuse passing checks when code, dependencies, and environment are unchanged; commit/push/PR transitions alone do not require reruns. Run repository-wide checks when explicitly requested as well.
 - Review this task's changes for correctness, security, and regressions. For local work, inspect unstaged/staged diffs (`git diff`, `git diff --cached`) and new files; for a branch/PR review, use the actual target branch's merge-base diff. Local self-review does not require a GitHub event, remote review, or posting comments.
+
+## Retained local runtime patches
+
+Before rebuilding or deploying an existing customized HAPI runtime, read
+[the local runtime release contract](docs/operations/local-runtime-release.md).
+Inventory the active release and process images, retain dependency patches,
+run the complete named regression set, and verify compiled/served artifacts.
+A clean checkout or matching version number is not evidence of patch parity.

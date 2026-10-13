@@ -273,6 +273,7 @@ describe('authenticated owning-machine proof across a Hub migration', () => {
     const execAsync = promisify(exec)
     it('retains the remote ownership lease until exact Hub CAS and stores the raw audit on the Hub', async () => {
         const f = await runtimeFixture('remote-empty')
+        fs.chmodSync(f.codexHome, 0o775)
         const hub = path.join(f.root, 'new-hub'); fs.mkdirSync(hub, { mode: 0o700 })
         const helper = path.join(f.root, 'proof.py'); fs.writeFileSync(helper, OFFLINE_NATIVE_PROOF_SOURCE, { mode: 0o600 })
         const phases: ProofPhase[] = []
@@ -319,11 +320,12 @@ describe('authenticated owning-machine proof across a Hub migration', () => {
         } finally { await f.close() }
     })
 
-    for (const condition of ['new-native-alias', 'orphan-engine', 'wrong-machine', 'audit-symlink', 'missing-confirmation', 'snapshot-substitution', 'expired-lease', 'worker-substitution']) {
+    for (const condition of ['new-native-alias', 'orphan-engine', 'writable-native-home', 'wrong-machine', 'audit-symlink', 'missing-confirmation', 'snapshot-substitution', 'expired-lease', 'worker-substitution']) {
         it(`keeps the original row on cross-machine ${condition}`, async () => {
             const f = await runtimeFixture('remote-empty')
             const hub = path.join(f.root, 'new-hub'); fs.mkdirSync(hub, { mode: 0o700 })
             const helper = path.join(f.root, 'proof.py'); fs.writeFileSync(helper, OFFLINE_NATIVE_PROOF_SOURCE, { mode: 0o600 })
+            if (condition === 'writable-native-home') fs.chmodSync(f.codexHome, 0o777)
             const orphan = condition === 'orphan-engine' ? Bun.spawn(['/usr/bin/python3', '-I', '-c', 'import time;time.sleep(30)',
                 '--listen', 'unix://' + path.join(f.root, 'old', 'engine.sock')], { stdout: 'ignore', stderr: 'ignore' }) : null
             if (condition === 'audit-symlink') fs.symlinkSync(f.root, path.join(hub, 'offline-message-discard-audits'))

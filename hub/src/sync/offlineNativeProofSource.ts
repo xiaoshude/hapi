@@ -2,7 +2,7 @@ import { NATIVE_QUEUE_PROOF_SCRIPT } from './offlineMessageDiscard'
 
 // Installed on the owning Runner, never executed against a caller-supplied home.
 export const OFFLINE_NATIVE_PROOF_SOURCE = `NATIVE_SCRIPT = ${JSON.stringify(NATIVE_QUEUE_PROOF_SCRIPT)}\n` + String.raw`
-import os,sys,json,time,stat,hashlib,base64,re,socket,struct,subprocess,threading,select
+import os,sys,json,time,stat,hashlib,base64,re,socket,struct,subprocess,threading,select,grp,pwd,errno
 from pathlib import Path
 UUID=re.compile(r'[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}')
 def need(ok,code):
@@ -10,6 +10,20 @@ def need(ok,code):
 def digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
 def directory(p):
     s=p.lstat();need(stat.S_ISDIR(s.st_mode) and p.resolve()==p and not p.is_symlink() and s.st_uid==os.getuid() and s.st_mode&0o022==0,'PROOF_DIRECTORY_UNSAFE')
+def native_home(p):
+    s=p.lstat();need(stat.S_ISDIR(s.st_mode) and p.resolve()==p and not p.is_symlink() and s.st_uid==os.getuid() and s.st_mode&0o002==0,'PROOF_NATIVE_HOME_UNSAFE')
+    if not s.st_mode&0o020:return
+    # A user-private primary group grants the same principal, not another writer.
+    user=pwd.getpwuid(os.getuid());group=grp.getgrgid(s.st_gid)
+    need(s.st_gid==user.pw_gid and group.gr_name==user.pw_name and all(n==user.pw_name for n in group.gr_mem),'PROOF_NATIVE_HOME_GROUP_UNPROVEN')
+    nss=Path('/etc/nsswitch.conf').read_text();need(len(nss)<=65536,'PROOF_NSS_LIMIT')
+    for key in ['passwd','group']:
+        lines=re.findall(r'^'+key+r':\s*(.*)$',nss,re.M);need(len(lines)==1,'PROOF_NSS_UNPROVEN')
+        providers=re.sub(r'\[[^\]]*\]','',lines[0].split('#',1)[0]).split()
+        need(providers and providers[0]=='files' and set(providers)<=set(['files','systemd']),'PROOF_NSS_UNPROVEN')
+    accounts=pwd.getpwall();need(len(accounts)<=4096 and all(a.pw_uid==os.getuid() for a in accounts if a.pw_gid==s.st_gid),'PROOF_NATIVE_HOME_GROUP_UNPROVEN')
+    try:os.getxattr(p,'system.posix_acl_access');raise RuntimeError('PROOF_NATIVE_HOME_ACL_UNPROVEN')
+    except OSError as e:need(e.errno==errno.ENODATA,'PROOF_NATIVE_HOME_ACL_UNPROVEN')
 def identity(p):
     s=p.lstat();return (s.st_dev,s.st_ino)
 def record(p):
@@ -42,7 +56,7 @@ def inspect(home,r):
             need(marker(v['pid'])==v.get('marker') and marker(v['serverPid'])==v.get('serverMarker'),'PROOF_OBSERVER_GENERATION_MISMATCH')
             witnesses.append((v,h,proc(v['pid']),server))
     need(len(witnesses)==1,'PROOF_OBSERVER_UNPROVEN');w,h,wp,sp=witnesses[0]
-    codex=Path(w.get('codexHome',''));directory(codex);owners=codex/'hapi-runtime-owners';directory(owners)
+    codex=Path(w.get('codexHome',''));native_home(codex);owners=codex/'hapi-runtime-owners';directory(owners)
     for p in sorted(owners.glob('*.json')):
         need(UUID.fullmatch(p.stem),'PROOF_REGISTRY_NAME_INVALID');v,k,n=record(p);total+=n;records.append((v,k))
     need(len(records)<=8192 and total<=16777216,'PROOF_REGISTRY_LIMIT')

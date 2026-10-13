@@ -96,6 +96,30 @@ function toStoredMessage(row: DbMessageRow): StoredMessage {
     }
 }
 
+/** One exact row, including its original compressed/text bytes, for explicit discard audits. */
+export function getMessageDiscardSnapshot(db: Database, sessionId: string, messageId: string) {
+    const row = db.prepare('SELECT * FROM messages WHERE session_id = ? AND (id = ? OR local_id = ?) LIMIT 1')
+        .get(sessionId, messageId, messageId) as DbMessageRow | undefined
+    if (!row) return null
+    const bytes = Buffer.from(row.content)
+    if (bytes.length > 1024 * 1024) throw new Error('DISCARD_MESSAGE_TOO_LARGE')
+    return { message: toStoredMessage(row), encodedContent: row.content,
+        contentStorage: typeof row.content === 'string' ? 'text' : 'blob', contentBase64: bytes.toString('base64') }
+}
+
+/** CAS: never discard a changed, invoked, queued or currently dispatching row. */
+export function discardIndeterminateMessage(db: Database, snapshot: NonNullable<ReturnType<typeof getMessageDiscardSnapshot>>): boolean {
+    const m = snapshot.message
+    return db.transaction(() => {
+        const deleted = db.prepare(`DELETE FROM messages WHERE session_id = ? AND id = ?
+            AND local_id IS ? AND seq = ? AND created_at = ? AND scheduled_at IS ?
+            AND content = ? AND invoked_at IS NULL AND delivery_state = 'indeterminate'`)
+            .run(m.sessionId, m.id, m.localId, m.seq, m.createdAt, m.scheduledAt, snapshot.encodedContent)
+        if (deleted.changes) bumpMessageEpoch(db, m.sessionId)
+        return deleted.changes === 1
+    })()
+}
+
 export type CopyStoredMessageInput = Pick<
     StoredMessage,
     'content' | 'createdAt' | 'localId' | 'invokedAt' | 'scheduledAt' | 'deliveryState'

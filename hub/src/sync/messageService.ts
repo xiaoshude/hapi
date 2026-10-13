@@ -17,6 +17,8 @@ import type { Server } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import type { Store, CancelQueuedMessageResult } from '../store'
 import { EventPublisher } from './eventPublisher'
+import { OfflineDiscardRefused, snapshotDigest,
+    type OfflineDiscardExecutor, type OfflineDiscardResult } from './offlineMessageDiscard'
 
 type StoredMessageForDelivery = ReturnType<Store['messages']['getMessages']>[number]
 type MessagePosition = { at: number; seq: number }
@@ -164,7 +166,8 @@ export class MessageService {
         private readonly store: Store,
         private readonly io: Server,
         private readonly publisher: EventPublisher,
-        private readonly onSessionActivity?: (sessionId: string, updatedAt: number) => void
+        private readonly onSessionActivity?: (sessionId: string, updatedAt: number) => void,
+        private readonly offlineDiscard: OfflineDiscardExecutor | null = null
     ) {
     }
 
@@ -471,6 +474,52 @@ export class MessageService {
             scheduledAt: message.scheduledAt,
             ...(message.deliveryState ? { deliveryState: message.deliveryState } : {})
         }))
+    }
+
+    getOfflineDiscardInfo(sessionId: string, messageId: string) {
+        const lookup = this.store.messages.lookupQueuedMessage(sessionId, messageId)
+        if (lookup.status !== 'indeterminate') return { status: lookup.status }
+        const snapshot = this.store.messages.getDiscardSnapshot(sessionId, messageId)
+        return snapshot ? { status: lookup.status, messageId: snapshot.message.id,
+            localId: snapshot.message.localId, expectedSnapshotSha256: snapshotDigest(snapshot) } : { status: 'absent' }
+    }
+
+    async discardOfflineIndeterminateMessage(sessionId: string, messageId: string,
+        expectedSnapshotSha256: string, target: Session, observer: Session, current: () => boolean)
+        : Promise<OfflineDiscardResult> {
+        const lookup = this.store.messages.lookupQueuedMessage(sessionId, messageId)
+        if (lookup.status === 'absent') return { status: 'cancelled', localId: null }
+        if (lookup.status === 'invoked') return lookup
+        const localId = lookup.localId
+        const busy = (code: string) => ({ status: 'busy' as const, localId, code })
+        const connected = () => (this.io.of('/cli').adapter.rooms.get(`session:${sessionId}`)?.size ?? 0) > 0
+        if (lookup.status !== 'indeterminate' || !localId || target.active || !observer.active
+            || target.id === observer.id || target.namespace !== observer.namespace || connected()
+            || target.metadata?.flavor !== 'codex' || observer.metadata?.flavor !== 'codex'
+            || target.metadata?.capabilities?.concurrentClients !== true
+            || observer.metadata?.capabilities?.concurrentClients !== true
+            || !target.metadata?.codexSessionId || !observer.metadata?.hostPid || !observer.metadata.codexSessionId
+            || !target.metadata.machineId || target.metadata.machineId !== observer.metadata.machineId
+            || !current()) return busy('OFFLINE_DISCARD_NOT_ELIGIBLE')
+        if (!this.offlineDiscard) return busy('OFFLINE_DISCARD_NOT_CONFIGURED')
+        const snapshot = this.store.messages.getDiscardSnapshot(sessionId, messageId)
+        if (!snapshot || snapshotDigest(snapshot) !== expectedSnapshotSha256) return busy('OFFLINE_DISCARD_SNAPSHOT_CHANGED')
+        try {
+            return await this.offlineDiscard({ sessionId, threadId: target.metadata.codexSessionId,
+                observerSessionId: observer.id, observerPid: observer.metadata.hostPid,
+                observerThreadId: observer.metadata.codexSessionId, machineId: target.metadata.machineId,
+                namespace: target.namespace, snapshot }, () => {
+                const settled = this.store.messages.lookupQueuedMessage(sessionId, messageId)
+                if (settled.status === 'invoked') return settled
+                if (settled.status === 'absent') return { status: 'cancelled', localId }
+                if (connected() || !current() || settled.status !== 'indeterminate'
+                    || !this.store.messages.discardIndeterminate(snapshot)) return { status: 'busy', localId: localId!, code: 'OFFLINE_DISCARD_STATE_CHANGED' }
+                this.publisher.emit({ type: 'message-cancelled', sessionId, messageId, localId })
+                return { status: 'cancelled', localId }
+            })
+        } catch (e) {
+            return busy(e instanceof OfflineDiscardRefused ? e.code : 'OFFLINE_DISCARD_PROOF_UNAVAILABLE')
+        }
     }
 
     async cancelQueuedMessage(

@@ -5,6 +5,8 @@ import { decodeMessageContent } from './contentCodec'
 
 import type { StoredMessage } from './types'
 import {
+    getMessageDiscardSnapshot,
+    discardIndeterminateMessage,
     addMessage,
     syncNativeQueuedMessage,
     addImportedMessage,
@@ -53,6 +55,14 @@ export class MessageStore {
 
     constructor(db: Database) {
         this.db = db
+    }
+
+    getDiscardSnapshot(sessionId: string, messageId: string) {
+        return getMessageDiscardSnapshot(this.db, sessionId, messageId)
+    }
+
+    discardIndeterminate(snapshot: NonNullable<ReturnType<MessageStore['getDiscardSnapshot']>>): boolean {
+        return discardIndeterminateMessage(this.db, snapshot)
     }
 
     addMessage(sessionId: string, content: unknown, localId?: string, scheduledAt?: number | null, createdAt?: number): StoredMessage {

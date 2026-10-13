@@ -29,6 +29,9 @@ import { CursorLegacyMigrator, type CursorLegacyMigratorOptions } from '../curso
 import { EventPublisher, type SyncEventListener } from './eventPublisher'
 import { MachineCache, type Machine } from './machineCache'
 import { MessageService, type RetryIndeterminateMessageResult } from './messageService'
+import { createRemoteOfflineDiscardExecutor } from './remoteOfflineDiscard'
+import { OfflineDiscardRefused } from './offlineMessageDiscard'
+import { dirname } from 'node:path'
 import { createTitleSuggestionService, type TitleSuggestionService } from './titleSuggestion'
 import { selectForkTranscriptPrefix } from './forkTranscript'
 import { buildForkSessionSummary } from './forkSessionSummary'
@@ -225,14 +228,22 @@ export class SyncEngine {
             }
         })
         this.machineCache = new MachineCache(store, this.eventPublisher)
+        this.rpcGateway = new RpcGateway(io, rpcRegistry)
         this.messageService = new MessageService(
             store,
             io,
             this.eventPublisher,
-            (sessionId, updatedAt) => this.recordSessionActivity(sessionId, updatedAt)
+            (sessionId, updatedAt) => this.recordSessionActivity(sessionId, updatedAt),
+            typeof store.dbPath === 'string' && !store.dbPath.includes(':memory:')
+                ? createRemoteOfflineDiscardExecutor(dirname(store.dbPath), async (request, phase) => {
+                    const machine = this.machineCache.getMachine(request.machineId)
+                    if (!machine || machine.namespace !== request.namespace || !machine.active) {
+                        throw new OfflineDiscardRefused('OFFLINE_PROOF_MACHINE_UNAVAILABLE')
+                    }
+                    return this.rpcGateway.offlineNativeProof(request, phase)
+                }) : null
         )
         this.titleSuggestionService = createTitleSuggestionService(store)
-        this.rpcGateway = new RpcGateway(io, rpcRegistry)
         this.reloadAll()
         this.inactivityTimer = setInterval(() => this.expireInactive(), 5_000)
     }
@@ -1040,6 +1051,25 @@ export class SyncEngine {
         const { actualSessionId, createdAt: activeTurnStartedAt } = await this.messageService.sendMessage(sessionId, payload)
         this.sessionCache.markMessageQueued(actualSessionId, Date.now(), activeTurnStartedAt)
         this.sessionCache.recordSessionActivity(actualSessionId, Date.now())
+    }
+
+    getOfflineDiscardInfo(sessionId: string, messageId: string) {
+        return this.messageService.getOfflineDiscardInfo(sessionId, messageId)
+    }
+
+    async discardOfflineIndeterminateMessage(sessionId: string, messageId: string,
+        observerSessionId: string, expectedSnapshotSha256: string) {
+        const target = this.getSession(sessionId), observer = this.getSession(observerSessionId)
+        if (!target || !observer) return { status: 'busy' as const, localId: null, code: 'OFFLINE_DISCARD_SESSION_UNAVAILABLE' }
+        const targetVersion = target.metadataVersion, observerVersion = observer.metadataVersion
+        const current = () => {
+            const old = this.getSession(sessionId), witness = this.getSession(observerSessionId)
+            return Boolean(old && witness && !old.active && witness.active
+                && old.metadataVersion === targetVersion && witness.metadataVersion === observerVersion
+                && !this.historyActionsInFlight.has(sessionId))
+        }
+        return this.messageService.discardOfflineIndeterminateMessage(sessionId, messageId,
+            expectedSnapshotSha256, target, observer, current)
     }
 
     async cancelQueuedMessage(

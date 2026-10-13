@@ -1,5 +1,6 @@
 import type { AgentFlavor, CodexCollaborationMode, CopilotAgentMode, PermissionMode } from '@hapi/protocol/types'
 import { RPC_METHODS } from '@hapi/protocol/rpcMethods'
+import { offlineProofCommand, type ProofRequest, type ProofPhase } from './remoteOfflineDiscard'
 import { CODEX_START_RPC_TIMEOUT_MS, CODEX_RESUME_RPC_TIMEOUT_MS, CODEX_STEER_RPC_TIMEOUT_MS } from '@hapi/protocol/codexTimeouts'
 import {
     ArchiveCodexSessionRpcResponseSchema,
@@ -541,6 +542,12 @@ export class RpcGateway {
         timeoutMs: number = DEFAULT_RPC_TIMEOUT_MS
     ): Promise<unknown> {
         return await this.rpcCall(`${machineId}:${method}`, params, timeoutMs)
+    }
+
+    async offlineNativeProof(request: ProofRequest, phase: ProofPhase): Promise<unknown> {
+        return this.machineRpc(request.machineId, RPC_METHODS.Bash,
+            { command: offlineProofCommand(request, phase), timeout: phase === 'finish' ? 2000 : 24000 },
+            phase === 'finish' ? 3000 : 25000)
     }
 
     private async rpcCall(method: string, params: unknown, timeoutMs: number = DEFAULT_RPC_TIMEOUT_MS): Promise<unknown> {
